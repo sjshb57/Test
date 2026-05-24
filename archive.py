@@ -162,17 +162,17 @@ BACKOFF_JITTER_MAX = 0.2
 MAX_BACKOFF        = 20.0
 
 # 媒体下载 timeout（图/头像不需要 wayback 那么长，但要给 SSL 握手留余地）
-MEDIA_TIMEOUT_IMAGE  = 12   # 图片/头像：40s 内下不完就放弃
-MEDIA_TIMEOUT_VIDEO  = 20   # 视频文件可能大，保留 60s
-WAYBACK_HTML_TIMEOUT = 30   # wayback HTML：保持 60s（限速时确实需要等）
+MEDIA_TIMEOUT_IMAGE  = 8   # 图片/头像：40s 内下不完就放弃
+MEDIA_TIMEOUT_VIDEO  = 15   # 视频文件可能大，保留 60s
+WAYBACK_HTML_TIMEOUT = 20   # wayback HTML：保持 60s（限速时确实需要等）
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
 DEFAULT_WORKERS_HTML   = 30
 DEFAULT_WORKERS_MEDIA  = 40   # pbs.twimg.com 比 wayback 宽松，可以更高并发
-DEFAULT_WORKERS_AVATAR = 16
-DEFAULT_DELAY_HTML     = 0.2
-DEFAULT_DELAY_MEDIA    = 0.1
-DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
+DEFAULT_WORKERS_AVATAR = 20
+DEFAULT_DELAY_HTML     = 0.15
+DEFAULT_DELAY_MEDIA    = 0.08
+DEFAULT_DELAY_AVATAR_RANGE = (0.02, 0.1)
 
 # 索引/渲染
 TEXT_MAX = 500
