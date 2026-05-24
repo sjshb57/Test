@@ -156,23 +156,24 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 1    # GH Actions 网络稳定，3 次足够；减少超时等待时间
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 20.0
+MAX_BACKOFF        = 10  # 限速一般 30s 恢复，不需要等 120s
 
-# 媒体下载 timeout（图/头像不需要 wayback 那么长，但要给 SSL 握手留余地）
-MEDIA_TIMEOUT_IMAGE  = 8   # 图片/头像：40s 内下不完就放弃
-MEDIA_TIMEOUT_VIDEO  = 15   # 视频文件可能大，保留 60s
-WAYBACK_HTML_TIMEOUT = 20   # wayback HTML：保持 60s（限速时确实需要等）
+# 媒体下载 timeout（数据中心出口带宽大，超时阈值可以压低）
+MEDIA_TIMEOUT_IMAGE  = (2, 8)   # 图片/头像：(connect, read)，connect 超 5s 视为限速
+MEDIA_TIMEOUT_VIDEO  = (2, 15)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (2, 5)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
+# GH Actions 每次跑 IP 不固定，wayback/pbs 限速从零计，可大幅提高并发、降低延迟
 DEFAULT_WORKERS_HTML   = 30
-DEFAULT_WORKERS_MEDIA  = 40   # pbs.twimg.com 比 wayback 宽松，可以更高并发
+DEFAULT_WORKERS_MEDIA  = 40
 DEFAULT_WORKERS_AVATAR = 30
 DEFAULT_DELAY_HTML     = 0.15
 DEFAULT_DELAY_MEDIA    = 0.08
-DEFAULT_DELAY_AVATAR_RANGE = (0.02, 0.1)
+DEFAULT_DELAY_AVATAR_RANGE = (0.02, 0.10)
 
 # 索引/渲染
 TEXT_MAX = 500
@@ -284,9 +285,11 @@ def _rate_limit_wait_from_response(response: requests.Response | None) -> float 
 
 
 def _should_retry(exc: Exception) -> bool:
-    # SSL 握手失败：实测在 wayback 场景下基本等于"该 URL 未归档"，
-    # 重试同一个 URL 没意义；直接抛给上层走下一个候选 URL（保留完整的候选回退列表）
+    # SSL 握手失败：wayback 场景下等于"该 URL 未归档"，直接试下一候选
     if isinstance(exc, requests.exceptions.SSLError):
+        return False
+    # ConnectTimeout：TCP 握手超时，通常是 wayback 限速拒绝连接，重试无意义
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
         return False
     if isinstance(exc, requests.HTTPError):
         if exc.response is not None:
@@ -859,14 +862,17 @@ def classify_failure(exc: Exception) -> str:
     把一个异常归类为 STATUS_FAILED（可救）或 STATUS_FAILED_ALL（永久）。
 
     永久失败：
-      - SSL 错误（实测在 wayback 场景下等于"未归档"，重试无用）
+      - SSL 错误（wayback 场景下等于"未归档"，重试无用）
       - HTTP 4xx 除 408/429
     可救失败：
+      - ConnectTimeout（TCP 握手超时，通常是 wayback 限速，换时间/IP 可能成功）
       - HTTP 408/429/5xx
       - 超时 / 网络错误 / ChunkedEncodingError / 响应过短 / Content-Type 异常
     """
     if isinstance(exc, requests.exceptions.SSLError):
         return STATUS_FAILED_ALL
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return STATUS_FAILED
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         sc = exc.response.status_code
         if 400 <= sc < 500 and sc not in (408, 429):
