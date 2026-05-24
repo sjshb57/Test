@@ -164,11 +164,11 @@ MAX_BACKOFF        = 10  # 限速一般 30s 恢复，不需要等 120s
 # 媒体下载 timeout（数据中心出口带宽大，超时阈值可以压低）
 MEDIA_TIMEOUT_IMAGE  = (2, 8)   # 图片/头像：(connect, read)，connect 超 5s 视为限速
 MEDIA_TIMEOUT_VIDEO  = (2, 15)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (2, 5)   # wayback HTML
+WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
 # GH Actions 每次跑 IP 不固定，wayback/pbs 限速从零计，可大幅提高并发、降低延迟
-DEFAULT_WORKERS_HTML   = 30
+DEFAULT_WORKERS_HTML   = 20
 DEFAULT_WORKERS_MEDIA  = 40
 DEFAULT_WORKERS_AVATAR = 30
 DEFAULT_DELAY_HTML     = 0.15
