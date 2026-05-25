@@ -156,24 +156,24 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 1    # GH Actions 网络稳定，3 次足够；减少超时等待时间
+REQUEST_ATTEMPTS   = 5   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 10  # 限速一般 30s 恢复，不需要等 120s
+MAX_BACKOFF        = 120.0
 
-# 媒体下载 timeout（数据中心出口带宽大，超时阈值可以压低）
-MEDIA_TIMEOUT_IMAGE  = (2, 8)   # 图片/头像：(connect, read)，connect 超 5s 视为限速
-MEDIA_TIMEOUT_VIDEO  = (2, 15)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
+# 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
+# connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
+MEDIA_TIMEOUT_IMAGE  = (5, 40)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (5, 60)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (5, 60)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
-# GH Actions 每次跑 IP 不固定，wayback/pbs 限速从零计，可大幅提高并发、降低延迟
-DEFAULT_WORKERS_HTML   = 20
-DEFAULT_WORKERS_MEDIA  = 40
-DEFAULT_WORKERS_AVATAR = 30
-DEFAULT_DELAY_HTML     = 0.15
-DEFAULT_DELAY_MEDIA    = 0.08
-DEFAULT_DELAY_AVATAR_RANGE = (0.02, 0.10)
+DEFAULT_WORKERS_HTML   = 7
+DEFAULT_WORKERS_MEDIA  = 8
+DEFAULT_WORKERS_AVATAR = 4
+DEFAULT_DELAY_HTML     = 0.8
+DEFAULT_DELAY_MEDIA    = 0.3
+DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
 
 # 索引/渲染
 TEXT_MAX = 500
@@ -2616,6 +2616,30 @@ def _bi_build_video_index() -> dict:
     return index
 
 
+def _bi_build_avatar_index() -> dict:
+    """pid → "../avatar/完整文件名"（含正确 ext）。"""
+    if not os.path.isdir(AVATAR_DIR):
+        return {}
+    index: dict[str, str] = {}
+    for fname in sorted(os.listdir(AVATAR_DIR)):
+        pid = extract_avatar_pid_from_filename(fname)
+        if pid and pid not in index:
+            index[pid] = f"../avatar/{fname}"
+    return index
+
+
+def _bi_resolve_avatar(src: str, avatar_index: dict) -> str:
+    """把 wayback/pbs 头像 URL 转成本地路径；找不到返回原 src。"""
+    if not src:
+        return src
+    if src.startswith("../avatar/"):
+        return src  # 已经是本地路径（clean-html 跑过的场景，兼容）
+    pid = extract_profile_image_id(src)
+    if pid and pid in avatar_index:
+        return avatar_index[pid]
+    return src
+
+
 def _bi_extract_date(html_text: str) -> str:
     """从 HTML 的 #parentdate 关联 script 提取 dateString。"""
     script_blocks = re.findall(
@@ -3554,8 +3578,10 @@ def cmd_build_index(args: argparse.Namespace) -> int:
 
     image_index = _bi_build_image_index()
     video_index = _bi_build_video_index()
+    avatar_index = _bi_build_avatar_index()
     safe_print(f"本地图片索引：{len(image_index)} 张图片（按 basename 索引）")
     safe_print(f"本地视频索引：{len(video_index)} 个视频（按 media_key 索引）")
+    safe_print(f"本地头像索引：{len(avatar_index)} 个头像（按 pid 索引）")
     tweet_id_index = _bi_build_tweet_id_index()
     safe_print(f"本地推文索引：{len(tweet_id_index)} 条 tweet_id（用于祖先链追溯）\n")
 
@@ -3592,6 +3618,25 @@ def cmd_build_index(args: argparse.Namespace) -> int:
         embedded_images  = [image_index[b] for b in meta.get("embedded_basenames",  []) if b in image_index]
         wanted_videos    = [video_index[k] for k in meta.get("wanted_video_keys",   []) if k in video_index]
         embedded_videos  = [video_index[k] for k in meta.get("embedded_video_keys", []) if k in video_index]
+
+        # 解析头像：把 wayback/pbs URL 转成本地路径
+        render_data["author_avatar"] = _bi_resolve_avatar(
+            render_data.get("author_avatar", ""), avatar_index
+        )
+        if render_data.get("embedded") and render_data["embedded"].get("author_avatar"):
+            render_data["embedded"]["author_avatar"] = _bi_resolve_avatar(
+                render_data["embedded"]["author_avatar"], avatar_index
+            )
+
+        # wanted_avatars：推文里所有用户的本地头像路径（用于前端直接引用，不依赖猜 pid）
+        wanted_avatars: list[str] = []
+        if json_data:
+            for user in (json_data.get("includes", {}) or {}).get("users", []) or []:
+                pid = extract_profile_image_id(user.get("profile_image_url", ""))
+                if pid and pid in avatar_index:
+                    local_av = avatar_index[pid]
+                    if local_av not in wanted_avatars:
+                        wanted_avatars.append(local_av)
 
         def clean_urls(s: str, urls: list[str]) -> str:
             if not s or not urls:
@@ -3630,6 +3675,7 @@ def cmd_build_index(args: argparse.Namespace) -> int:
             "embedded_images":   embedded_images,
             "wanted_videos":     wanted_videos,
             "embedded_videos":   embedded_videos,
+            "wanted_avatars":    wanted_avatars,
             "remove_urls":         meta.get("remove_urls", []),
             "embedded_remove_urls":meta.get("embedded_remove_urls", []),
             "is_virtual":      False,
