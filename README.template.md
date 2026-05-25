@@ -20,5 +20,5 @@
 
 > 内容版权归原作者所有，本仓库仅用于存档与纪念目的。
 
-**本仓库 Fork 自 [sjshb57/IncandescenceArchiver](https://github.com/sjshb57/Test)，
+**本仓库 Fork 自 [sjshb57/IncandescenceArchiver](https://github.com/sjshb57/IncandescenceArchiver)，
 遵循上游项目 [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) 开源协议。**
