@@ -6,7 +6,7 @@ archive.py — IncandescenceReader 一体化存档工具
 合并了原本分散在 8 个脚本里的所有功能：
   fetch_json.py / 0037.py 的下载部分 → fetch-html
   fetch_media.py                    → fetch-media
-  0037.py 的清洗部分                → clean-html
+  0037.py 的清洗部分                 → clean-html
   build_index.py                    → build-index
   fetch_avatars.py                  → fetch-avatars
   dedup_media.py                    → dedup
@@ -25,6 +25,7 @@ archive.py — IncandescenceReader 一体化存档工具
   python ../../archive.py fetch-cdx <username>
   python ../../archive.py fetch-html
   python ../../archive.py fetch-media
+  python ../../archive.py clean-html
   python ../../archive.py build-index
   # 或一把梭（不含 fetch-cdx）：
   python ../../archive.py all
@@ -112,11 +113,6 @@ DONE_AVATAR          = os.path.join(LOG_DIR, "avatar_done.txt")
 FAILED_AVATAR        = os.path.join(LOG_DIR, "avatar_failed.txt")
 FAILED_AVATAR_ALL    = os.path.join(LOG_DIR, "avatar_failed_all.txt")
 
-# HTML 清洗级（HTML 文件名粒度）
-DONE_CLEAN           = os.path.join(LOG_DIR, "clean_done.txt")
-FAILED_CLEAN         = os.path.join(LOG_DIR, "clean_failed.txt")
-FAILED_CLEAN_ALL     = os.path.join(LOG_DIR, "clean_failed_all.txt")
-
 # 所有 .txt 文件的列表（用于初始化时统一确保存在）
 ALL_LOG_TXT_FILES = [
     DONE_HTML, FAILED_HTML, FAILED_HTML_ALL,
@@ -124,17 +120,8 @@ ALL_LOG_TXT_FILES = [
     DONE_IMAGE, FAILED_IMAGE, FAILED_IMAGE_ALL,
     DONE_VIDEO, FAILED_VIDEO, FAILED_VIDEO_ALL,
     DONE_AVATAR, FAILED_AVATAR, FAILED_AVATAR_ALL,
-    DONE_CLEAN, FAILED_CLEAN, FAILED_CLEAN_ALL,
 ]
 
-# 旧版兼容（仅用于迁移检测；新代码用上面的常量）
-LEGACY_NEGATIVE_CACHE_FILE = os.path.join(OUTPUT_DIR, "_negative_cache.json")
-LEGACY_DONE_HTML           = os.path.join(OUTPUT_DIR, "_done_list.txt")
-LEGACY_DONE_MEDIA          = os.path.join(OUTPUT_DIR, "_done_list_media.txt")
-LEGACY_FAILED_HTML         = os.path.join(OUTPUT_DIR, "_html_failed.txt")
-LEGACY_FAILED_MEDIA        = os.path.join(OUTPUT_DIR, "_media_failed.txt")
-LEGACY_FAILED_AVATARS      = os.path.join(OUTPUT_DIR, "_avatars_failed.txt")
-LEGACY_FAILED_CLEAN        = os.path.join(OUTPUT_DIR, "_clean_failed.txt")
 
 # 清单与备份
 URL_LIST_FILE   = os.path.join(OUTPUT_DIR, "_url_list.txt")
@@ -156,24 +143,24 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 5   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 10.0
+MAX_BACKOFF        = 60.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (3, 8)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
+MEDIA_TIMEOUT_IMAGE  = (5, 40)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (5, 60)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (5, 60)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
-DEFAULT_WORKERS_HTML   = 20
-DEFAULT_WORKERS_MEDIA  = 35
-DEFAULT_WORKERS_AVATAR = 30
-DEFAULT_DELAY_HTML     = 0.3
-DEFAULT_DELAY_MEDIA    = 0.1
-DEFAULT_DELAY_AVATAR_RANGE = (0.03, 0.15)
+DEFAULT_WORKERS_HTML   = 7
+DEFAULT_WORKERS_MEDIA  = 8
+DEFAULT_WORKERS_AVATAR = 4
+DEFAULT_DELAY_HTML     = 0.8
+DEFAULT_DELAY_MEDIA    = 0.3
+DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
 
 # 索引/渲染
 TEXT_MAX = 500
@@ -317,100 +304,6 @@ def _retry_wait_for(exc: Exception, attempt: int) -> float:
 
 
 # ============================================================================
-# ── 负缓存（失败 URL 跳过机制）──────────────────────────────────────────────
-# ============================================================================
-#
-# 维护一份 _negative_cache.json：
-#   { "<URL>": {"reason": "...", "status": 404, "attempts": 3, "last_attempt": <epoch>} }
-#
-# 默认 fetch 时：遇到缓存里的 URL 直接跳过，不浪费请求。
-# 启用 --retry / --retry-403 时：忽略缓存，强制再试一次。
-# 4xx（特别是 403/404）写入缓存；超时/SSL/限速 不写入（因为可能稍后会好）。
-
-_negative_cache_data: dict[str, dict] | None = None
-_negative_cache_lock = threading.Lock()
-_negative_cache_dirty = False
-
-
-def load_negative_cache() -> dict[str, dict]:
-    """加载负缓存（单例）。"""
-    global _negative_cache_data
-    with _negative_cache_lock:
-        if _negative_cache_data is not None:
-            return _negative_cache_data
-        if not os.path.exists(LEGACY_NEGATIVE_CACHE_FILE):
-            _negative_cache_data = {}
-            return _negative_cache_data
-        try:
-            with open(LEGACY_NEGATIVE_CACHE_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-            _negative_cache_data = data
-        except Exception:
-            _negative_cache_data = {}
-        return _negative_cache_data
-
-
-def save_negative_cache() -> None:
-    """把内存里的负缓存写回磁盘（只有 dirty 时才写）。"""
-    global _negative_cache_dirty
-    with _negative_cache_lock:
-        if not _negative_cache_dirty or _negative_cache_data is None:
-            return
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        tmp_path = LEGACY_NEGATIVE_CACHE_FILE + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(_negative_cache_data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, LEGACY_NEGATIVE_CACHE_FILE)
-            _negative_cache_dirty = False
-        except Exception as e:
-            safe_print(f"[警告] 负缓存写入失败：{e}")
-
-
-def is_in_negative_cache(url: str) -> bool:
-    """该 URL 是否在负缓存里（永久跳过）。"""
-    cache = load_negative_cache()
-    with _negative_cache_lock:
-        return url in cache
-
-
-def add_to_negative_cache(url: str, reason: str, status_code: int | None = None) -> None:
-    """添加一个 URL 到负缓存（4xx 类错误）。"""
-    global _negative_cache_dirty
-    cache = load_negative_cache()
-    now = time.time()
-    with _negative_cache_lock:
-        entry = cache.get(url, {})
-        entry["reason"] = reason
-        if status_code is not None:
-            entry["status"] = status_code
-        entry["attempts"] = entry.get("attempts", 0) + 1
-        entry["last_attempt"] = now
-        cache[url] = entry
-        _negative_cache_dirty = True
-
-
-def remove_from_negative_cache(url: str) -> None:
-    """从负缓存里移除（重试模式下，成功后调用）。"""
-    global _negative_cache_dirty
-    cache = load_negative_cache()
-    with _negative_cache_lock:
-        if url in cache:
-            cache.pop(url, None)
-            _negative_cache_dirty = True
-
-
-def maybe_record_negative(url: str, exc: Exception) -> None:
-    """把"看起来永远不会成功"的失败写入负缓存。其它（超时/SSL）不写。"""
-    if isinstance(exc, requests.HTTPError) and exc.response is not None:
-        sc = exc.response.status_code
-        if 400 <= sc < 500 and sc not in (408, 429):
-            add_to_negative_cache(url, reason=f"HTTP {sc}", status_code=sc)
-
-
-# ============================================================================
 # ── archive_index.json: 主账本系统 ──────────────────────────────────────────
 # ============================================================================
 #
@@ -453,7 +346,6 @@ KIND_IMAGE  = "images"
 KIND_VIDEO  = "videos"
 KIND_AVATAR = "avatars"
 KIND_MEDIA  = "media"      # JSON 文件级
-KIND_CLEAN  = "clean"      # HTML 文件名级
 
 # kind → 三个 .txt 文件路径
 KIND_TO_TXT_FILES: dict[str, tuple[str, str, str]] = {
@@ -462,7 +354,6 @@ KIND_TO_TXT_FILES: dict[str, tuple[str, str, str]] = {
     KIND_VIDEO:  (DONE_VIDEO,  FAILED_VIDEO,  FAILED_VIDEO_ALL),
     KIND_AVATAR: (DONE_AVATAR, FAILED_AVATAR, FAILED_AVATAR_ALL),
     KIND_MEDIA:  (DONE_MEDIA,  FAILED_MEDIA,  FAILED_MEDIA_ALL),
-    KIND_CLEAN:  (DONE_CLEAN,  FAILED_CLEAN,  FAILED_CLEAN_ALL),
 }
 
 
@@ -476,7 +367,6 @@ def _make_empty_archive_index() -> dict:
         KIND_VIDEO:  {},
         KIND_AVATAR: {},
         KIND_MEDIA:  {},
-        KIND_CLEAN:  {},
     }
 
 
@@ -976,7 +866,6 @@ def download_stream(url: str, filepath: str, log=None, timeout: int = 60,
 
 def download_with_candidates(urls: list[str], filepath: str, log=None,
                              headers: dict | None = None,
-                             skip_negative: bool = True,
                              timeout: int = 60) -> tuple[int, str]:
     """
     依次尝试每个候选 URL，任一成功即返回 (size, used_url)。
@@ -987,28 +876,20 @@ def download_with_candidates(urls: list[str], filepath: str, log=None,
       SSL / 4xx (除 408/429) → download_stream 不重试，直接抛 → 这里走下一个候选
       408/429/5xx/超时/网络抖动 → download_stream 重试 5 次
 
-    skip_negative=True 时跳过已在负缓存里的 URL；任一成功时把该 URL 从负缓存移除。
     """
     last_exc: Exception | None = None
     tried = 0
 
     for i, url in enumerate(urls, 1):
-        if skip_negative and is_in_negative_cache(url):
-            continue
         tried += 1
         try:
             if log and tried > 1:
                 log(f"  [候选 {i}/{len(urls)}] {url}")
             size = download_stream(url, filepath, log=log, headers=headers, timeout=timeout)
-            # 成功就把这个 URL 从负缓存清理掉（如果之前 403/404 过现在好了）
-            remove_from_negative_cache(url)
             return size, url
         except Exception as e:
             last_exc = e
-            maybe_record_negative(url, e)
             continue
-    if tried == 0:
-        raise RuntimeError("所有候选 URL 都在负缓存里，已跳过。用 --retry 强制重试。")
     if last_exc:
         raise last_exc
     raise RuntimeError("候选 URL 列表为空")
@@ -1519,14 +1400,18 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
     清洗与改写 HTML：
       1. 剥掉已有的 Source 注释（防止累积）
       2. 清理 <script> 里的 jsonview 噪声
-      3. 改写头像 src → ../avatar/avatar_{pid}.{ext}（找不到本地则按 name 反射）
-      4. 改写推文图片 src → ../image/{filename}
+      3. 改写头像 src → ../avatar/avatar_{pid}.{ext}（直接由 pid 构造，不查 media_index）
+      4. 改写推文图片 src → ../image/{filename}（本地有则用真实名，否则构造预期名）
       5. BS4：删 notice / jsonview / 无效图视频，替换 video src
       6. prettify + 去多余空行
       7. 顶部恰好写入 1 行 <!-- Source: ... -->
     """
     # 1. 剥旧 Source
     html_text = strip_existing_source_comments(html_text)
+
+    # 从 source_url 提取快照时间戳，用于构造图片预期文件名
+    _ts_m = re.search(r'/web/(\d{14})', source_url)
+    snapshot_ts = _ts_m.group(1) if _ts_m else ""
 
     # 2. script 清理
     html_text = re.sub(
@@ -1536,7 +1421,7 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
         flags=re.DOTALL,
     )
 
-    # 3. 替换头像 src（用正则，比 BS4 更精确地处理嵌入推文里的多个头像）
+    # 3. 替换头像 src — 直接用 pid 构造唯一本地路径，不查 media_index
     def avatar_replacer(match: re.Match) -> str:
         tag = match.group(0)
         src_m = re.search(
@@ -1547,18 +1432,11 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
             return tag
         src_url = src_m.group(1)
         pid = extract_profile_image_id(src_url)
-        alt_m = re.search(r'alt="([^"]*)"', tag)
-        name = alt_m.group(1) if alt_m else ""
-
-        fn, _hit = media_index.find_avatar(pid=pid, name=name)
-        if fn:
-            return tag.replace(src_m.group(0), f'src="../avatar/{fn}"')
-        # 找不到，给个预期文件名，后面 BS4 会删除找不到对应文件的标签
-        if pid:
-            ext = ".png" if ".png" in src_url.lower() else (
-                  ".gif" if ".gif" in src_url.lower() else ".jpg")
-            return tag.replace(src_m.group(0), f'src="../avatar/avatar_{pid}{ext}"')
-        return tag
+        if not pid:
+            return tag
+        ext = ".png" if ".png" in src_url.lower() else (
+              ".gif" if ".gif" in src_url.lower() else ".jpg")
+        return tag.replace(src_m.group(0), f'src="../avatar/avatar_{pid}{ext}"')
 
     html_text = re.sub(
         r'<img\s[^>]*src="https://web\.archive\.org/web/\d+im_/https://[^"]*profile_images/[^"]+"[^>]*/?>',
@@ -1576,6 +1454,17 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
             fn = media_index.find_image(basename)
             if fn:
                 return f'{prefix}../image/{fn}{suffix}'
+            # 没有本地记录 → 构造预期文件名（与 fetch-media 下载时一致）
+            if snapshot_ts:
+                # 从原始 pbs URL 构造安全文件名
+                _orig = re.search(r'im_/(https?://.*)', src_url)
+                _pbs_url = _orig.group(1) if _orig else src_url
+                _parsed = urlparse(_pbs_url)
+                _fbase = re.sub(r'[^\w\-_.]', '_',
+                                (_parsed.netloc + _parsed.path).strip('/'))[:120]
+                if not _fbase.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                    _fbase += ext_from_url(_pbs_url)
+                return f'{prefix}../image/{snapshot_ts}_{_fbase}{suffix}'
         return match.group(0)
 
     html_text = re.sub(
@@ -1597,15 +1486,10 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
     for tag in soup.find_all("div", id="jsonview"):
         tag.decompose()
 
-    # 图片：fn=None 时替换失败（media_index 里没记录，本地文件名未知），
-    # src 仍为 wayback 远程地址 → 删掉，防止 Pages 上出现外链或破图
-    for tag in soup.find_all("img", class_="tweet-image"):
-        src = tag.get("src", "")
-        if "web.archive.org" in src or src.startswith("http"):
-            tag.decompose()
+    # 图片：现在所有图片都已替换为本地路径（有记录用真实名，没记录用预期名）
+    # 不再需要删除 wayback 地址的图片标签，前端 onerror 处理文件不存在的情况
 
-    # 头像：已始终替换为预期本地路径 ../avatar/avatar_<pid>.jpg
-    # 文件不存在时由前端 onerror 处理（不显示破图），无需删除标签
+    # 头像：已始终替换为预期本地路径 ../avatar/avatar_<pid>.{ext}
 
     # 处理每个 <video>
     for video_tag in soup.find_all("video"):
@@ -1664,7 +1548,7 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
 # ============================================================================
 #
 # 一次下载，同时完成两件事：
-#   1. 把 wayback 原始 HTML 写到 html/{safe_filename}.html
+#   1. 把 wayback 原始 HTML 写到 html/{safe_filename}.html（未清洗，等 clean-html 处理）
 #   2. 从同一份 HTML 里提取 jsonview，写到 json/{safe_filename}.json
 #
 # 这样替代了原本 fetch_json.py + 0037.py 的网络下载部分（原来要请求两次同一 URL）。
@@ -1686,20 +1570,15 @@ def _process_one_snapshot(snapshot: tuple[str, str], force: bool,
     if not force and json_exists and html_exists:
         return True, wayback_url, ""  # 都齐了，跳过
 
-    # 负缓存（仅在非 force 时检查）
-    if not force and is_in_negative_cache(wayback_url):
-        return False, wayback_url, "在负缓存里（用 --retry 强制重试）"
-
     if delay > 0:
         time.sleep(delay)
 
     try:
         html_text = fetch_html_text(wayback_url, log=safe_print)
     except Exception as e:
-        maybe_record_negative(wayback_url, e)
         return False, wayback_url, f"HTML 下载失败：{type(e).__name__}: {e}"
 
-    # 写 HTML（原始 wayback 快照，媒体路径由前端动态替换）
+    # 写 HTML（未清洗，clean-html 阶段再处理）
     try:
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_text)
@@ -1719,11 +1598,6 @@ def _process_one_snapshot(snapshot: tuple[str, str], force: bool,
             json_status = f"（JSON 写入失败：{e}）"
     else:
         json_status = "（页面无 jsonview）"
-
-    # 即使 JSON 抽取失败，HTML 已落地视为成功（部分快照只有 HTML 没有 jsonview）
-    if force or not json_exists:
-        # 重试模式或首次：成功就把这个 URL 从负缓存清掉
-        remove_from_negative_cache(wayback_url)
 
     if json_ok:
         return True, wayback_url, ""
@@ -1834,7 +1708,6 @@ def cmd_fetch_html(args: argparse.Namespace) -> int:
         safe_print(f"[fetch-html] 失败 {len(failed)} 条已实时写入 {FAILED_HTML}")
 
     stop_archive_index_flush_thread_and_save()
-    save_negative_cache()
     safe_print(f"[fetch-html] 完成：成功 {success} / 失败 {len(failed)} / 总计 {len(to_run)}")
     return 0 if not failed else 1
 
@@ -1901,7 +1774,7 @@ def _download_one_image(item: dict, snapshot_ts: str, media_index: MediaIndex,
     url = item["url"]
     basename = extract_image_basename(url)
 
-    # 本地文件实际存在就跳过（force 时绕过 archive_index 状态，但不绕过本地文件）
+    # 本地文件实际存在就跳过（force 时绕过 archive_index 状态，但不重下已有文件）
     if basename:
         existing = media_index.find_image(basename)
         if existing and os.path.exists(os.path.join(IMAGE_DIR, existing)):
@@ -1922,7 +1795,6 @@ def _download_one_image(item: dict, snapshot_ts: str, media_index: MediaIndex,
 
     try:
         size, _used = download_with_candidates(candidates, fpath, log=safe_print,
-                                               skip_negative=not force,
                                                timeout=MEDIA_TIMEOUT_IMAGE)
         media_index.register_image(basename, fname)
         set_status(KIND_IMAGE, url, STATUS_DONE)
@@ -1957,7 +1829,6 @@ def _download_one_video(item: dict, snapshot_ts: str, media_index: MediaIndex,
 
     try:
         size, _used = download_with_candidates(candidates, fpath, log=safe_print,
-                                               skip_negative=not force,
                                                timeout=MEDIA_TIMEOUT_VIDEO)
         media_index.register_video(key, fname)
         set_status(KIND_VIDEO, url, STATUS_DONE)
@@ -1985,7 +1856,7 @@ def _download_one_avatar(item: dict, snapshot_ts: str, media_index: MediaIndex,
         set_status(KIND_AVATAR, url, STATUS_FAILED_ALL, reason="无法识别 profile pid")
         return False, "无法识别 profile pid"
 
-    # 复用检查（本地有就跳过，force 时也检查本地文件）
+    # 复用检查（本地有就跳过）
     existing, hit = media_index.find_avatar(pid=pid, name=name, username=username)
     if existing:
         media_index.register_avatar(pid, name, username, existing)
@@ -1999,7 +1870,6 @@ def _download_one_avatar(item: dict, snapshot_ts: str, media_index: MediaIndex,
 
     try:
         size, _used = download_with_candidates(candidates, fpath, log=safe_print,
-                                               skip_negative=not force,
                                                timeout=MEDIA_TIMEOUT_IMAGE)
         media_index.register_avatar(pid, name, username, fname)
         set_status(KIND_AVATAR, url, STATUS_DONE)
@@ -2218,7 +2088,6 @@ def cmd_fetch_media(args: argparse.Namespace) -> int:
         safe_print(f"[fetch-media] 失败 {len(failed_jsons)} 条已实时写入 {FAILED_MEDIA}")
 
     stop_archive_index_flush_thread_and_save()
-    save_negative_cache()  # 保留旧负缓存（向后兼容，过渡期）
     safe_print(f"[fetch-media] 完成：成功 {len(success_jsons)} / "
                f"失败 {len(failed_jsons)} / 总计 {len(to_run)}")
 
@@ -2401,7 +2270,6 @@ def cmd_fetch_avatars(args: argparse.Namespace) -> int:
         safe_print(f"[fetch-avatars] 失败 {len(failed)} 条已实时写入 {FAILED_AVATAR}")
 
     stop_archive_index_flush_thread_and_save()
-    save_negative_cache()
     safe_print(f"[fetch-avatars] 完成：新下载 {success} / 复用 {reused} / 失败 {len(failed)}")
     return 0 if not failed else 1
 
@@ -2412,7 +2280,7 @@ def cmd_fetch_avatars(args: argparse.Namespace) -> int:
 #
 # 读 html/ 里的 raw HTML，重写媒体路径为本地引用，原地覆盖。
 # 通过判断顶部是否已有 <!-- Source: ... --> 注释来识别"已清洗"，
-# 默认跳过已清洗文件；--force 强制重清；--retry 从失败列表读。
+# 默认跳过已清洗文件；--force 强制重清。
 # ============================================================================
 
 def _is_html_cleaned(path: str) -> bool:
@@ -2430,134 +2298,81 @@ def _extract_source_url_from_filename(fname: str) -> str:
     从 html 文件名反推回 wayback 的 if_ URL，作为 Source 注释里的来源标记。
     安全 fallback：如果反推不出来就用文件名本身。
     """
-    # safe_filename 格式：{ts}_{clean}.html
     base = fname[:-5] if fname.endswith(".html") else fname
     ts = extract_timestamp_from_filename(base)
     if not ts:
         return f"local://{fname}"
     rest = base[len(ts) + 1:]
-    # rest 是被 safe_filename 清洗过的 URL，不一定能完美还原
-    # 但保留 ts 和 cleaned-url 形式即可（足够追溯）
     return f"https://web.archive.org/web/{ts}if_/{rest}"
 
 
 def cmd_clean_html(args: argparse.Namespace) -> int:
     """子命令入口：清洗 html/ 里的 HTML。"""
     ensure_output_dirs()
-    load_archive_index()
-    install_sigint_handler()
-    start_archive_index_flush_thread()
 
     if not os.path.isdir(HTML_DIR):
         safe_print(f"[clean-html] HTML 目录不存在：{HTML_DIR}")
-        stop_archive_index_flush_thread_and_save()
         return 1
 
-    # 1. 候选文件
-    if args.retry:
-        retry_path = args.file or FAILED_CLEAN
-        if not os.path.exists(retry_path):
-            safe_print(f"[clean-html --retry] 失败列表不存在：{retry_path}")
-            stop_archive_index_flush_thread_and_save()
-            return 0
-        candidates = [ln for ln in load_failed_list(retry_path) if ln.endswith(".html")]
-        force = True
-    else:
-        candidates = sorted(f for f in os.listdir(HTML_DIR) if f.endswith(".html"))
-        force = bool(args.force)
-
+    candidates = sorted(f for f in os.listdir(HTML_DIR) if f.endswith(".html"))
     if not candidates:
         safe_print("[clean-html] 没有 HTML 文件")
-        stop_archive_index_flush_thread_and_save()
         return 0
 
-    # 2. 跳过已清洗（非强制）
+    force = bool(args.force)
+
+    # 跳过已清洗（用 Source 注释判断）
     to_run: list[str] = []
     skipped = 0
     for fname in candidates:
-        path = os.path.join(HTML_DIR, fname)
-        # 优先看 archive_index 状态
-        if not force:
-            st = get_status(KIND_CLEAN, fname)
-            if st == STATUS_DONE:
-                skipped += 1
-                continue
-            if st == STATUS_FAILED_ALL:
-                skipped += 1
-                continue
-            # archive_index 没有该项 → 用旧的 Source 注释判断（兼容旧数据）
-            if st is None and _is_html_cleaned(path):
-                set_status(KIND_CLEAN, fname, STATUS_DONE)  # 补登记
-                skipped += 1
-                continue
+        if not force and _is_html_cleaned(os.path.join(HTML_DIR, fname)):
+            skipped += 1
+            continue
         to_run.append(fname)
     if skipped:
         safe_print(f"  跳过已清洗：{skipped} 个")
     safe_print(f"[clean-html] 待清洗：{len(to_run)} 个")
 
     if not to_run:
-        stop_archive_index_flush_thread_and_save()
         return 0
 
-    # 3. 建索引（一次性，所有清洗共用）
+    # 建媒体索引（一次性，所有清洗共用）
     media_index = build_media_index(scan_json=True)
 
-    # 4. 清洗（CPU bound，少量并发即可）
-    workers = max(1, int(args.workers))
-    failed: list[str] = []
+    # 顺序清洗
+    failed = 0
     success = 0
-    lock = threading.Lock()
-
-    def clean_one(fname: str, i: int) -> None:
-        nonlocal success
+    total = len(to_run)
+    for i, fname in enumerate(to_run, 1):
         path = os.path.join(HTML_DIR, fname)
         try:
             with open(path, encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
-            with lock:
-                failed.append(fname)
-                set_status(KIND_CLEAN, fname, STATUS_FAILED, reason=f"读失败：{e}"[:200])
-                safe_print(f"[{i}/{len(to_run)}] ✗ {fname}  读失败：{e}")
-            return
+            safe_print(f"[{i}/{total}] ✗ {fname}  读失败：{e}")
+            failed += 1
+            continue
 
         source_url = _extract_source_url_from_filename(fname)
         try:
             cleaned = clean_html_text(content, source_url, media_index)
         except Exception as e:
-            with lock:
-                failed.append(fname)
-                set_status(KIND_CLEAN, fname, STATUS_FAILED,
-                           reason=f"清洗失败：{type(e).__name__}: {e}"[:200])
-                safe_print(f"[{i}/{len(to_run)}] ✗ {fname}  清洗失败：{type(e).__name__}: {e}")
-            return
+            safe_print(f"[{i}/{total}] ✗ {fname}  清洗失败：{type(e).__name__}: {e}")
+            failed += 1
+            continue
 
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(cleaned)
         except Exception as e:
-            with lock:
-                failed.append(fname)
-                set_status(KIND_CLEAN, fname, STATUS_FAILED, reason=f"写回失败：{e}"[:200])
-                safe_print(f"[{i}/{len(to_run)}] ✗ {fname}  写回失败：{e}")
-            return
+            safe_print(f"[{i}/{total}] ✗ {fname}  写回失败：{e}")
+            failed += 1
+            continue
 
-        with lock:
-            success += 1
-            set_status(KIND_CLEAN, fname, STATUS_DONE)
-            safe_print(f"[{i}/{len(to_run)}] ✓ {fname}")
+        success += 1
+        safe_print(f"[{i}/{total}] ✓ {fname}")
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futs = [executor.submit(clean_one, fn, i) for i, fn in enumerate(to_run, 1)]
-        for fut in as_completed(futs):
-            fut.result()
-
-    # 5. 状态已实时同步到 _log/clean_*.txt
-    if failed:
-        safe_print(f"[clean-html] 失败 {len(failed)} 条已实时写入 {FAILED_CLEAN}")
-
-    stop_archive_index_flush_thread_and_save()
-    safe_print(f"[clean-html] 完成：成功 {success} / 失败 {len(failed)}")
+    safe_print(f"[clean-html] 完成：成功 {success} / 失败 {failed}")
     return 0 if not failed else 1
 # ============================================================================
 # ── 子命令: build-index（与 GitHub IncandescenceReader/build_index.py 一致）─
@@ -3144,8 +2959,6 @@ _RETRY_TARGETS: dict[str, tuple[bool, str, str]] = {
     "media_failed_all":  (True,  KIND_MEDIA,  FAILED_MEDIA_ALL),
     "html_failed":       (False, KIND_HTML,   FAILED_HTML),
     "html_failed_all":   (True,  KIND_HTML,   FAILED_HTML_ALL),
-    "clean_failed":      (False, KIND_CLEAN,  FAILED_CLEAN),
-    "clean_failed_all":  (True,  KIND_CLEAN,  FAILED_CLEAN_ALL),
 }
 
 
@@ -3312,28 +3125,6 @@ def _retry_html_urls(urls: list[str]) -> int:
     return rc
 
 
-def _retry_clean_files(filenames: list[str]) -> int:
-    """重试 HTML 文件清洗。"""
-    if not filenames:
-        safe_print("[retry] 没有待重试的 HTML 文件")
-        return 0
-    tmp_path = os.path.join(LOG_DIR, "_retry_tmp_clean.txt")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for fn in filenames:
-                f.write(fn + "\n")
-        fake_args = argparse.Namespace(
-            retry=True, force=True, file=tmp_path, workers=4,
-        )
-        rc = cmd_clean_html(fake_args)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-    return rc
-
-
 def cmd_retry(args: argparse.Namespace) -> int:
     """retry 子命令统一入口。"""
     ensure_output_dirs()
@@ -3381,9 +3172,6 @@ def cmd_retry(args: argparse.Namespace) -> int:
             rc = _retry_media_jsons(json_files, force=True)
         elif kind == KIND_HTML:
             rc = _retry_html_urls(items)
-        elif kind == KIND_CLEAN:
-            html_files = [x for x in items if x.endswith(".html")]
-            rc = _retry_clean_files(html_files)
         else:
             safe_print(f"[retry] 未知 kind：{kind}")
             rc = 1
@@ -3498,7 +3286,6 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
         (DONE_IMAGE,  KIND_IMAGE), (FAILED_IMAGE_ALL,  KIND_IMAGE),  (FAILED_IMAGE,  KIND_IMAGE),
         (DONE_VIDEO,  KIND_VIDEO), (FAILED_VIDEO_ALL,  KIND_VIDEO),  (FAILED_VIDEO,  KIND_VIDEO),
         (DONE_AVATAR, KIND_AVATAR),(FAILED_AVATAR_ALL, KIND_AVATAR), (FAILED_AVATAR, KIND_AVATAR),
-        (DONE_CLEAN,  KIND_CLEAN), (FAILED_CLEAN_ALL,  KIND_CLEAN),  (FAILED_CLEAN,  KIND_CLEAN),
     ]:
         # 根据 path 的后缀决定 status
         if path.endswith("_done.txt"):
@@ -3532,7 +3319,7 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
         _txt_sets.clear()
 
     # 对每个 (kind, key)，按当前 status 写入对应 .txt
-    for kind in [KIND_HTML, KIND_MEDIA, KIND_IMAGE, KIND_VIDEO, KIND_AVATAR, KIND_CLEAN]:
+    for kind in [KIND_HTML, KIND_MEDIA, KIND_IMAGE, KIND_VIDEO, KIND_AVATAR]:
         with _archive_index_lock:
             entries = list(idx[kind].items())
         for key, rec in entries:
@@ -3545,7 +3332,7 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
 
     # 8. 统计
     safe_print("[rebuild-index] 完成。统计：")
-    for kind in [KIND_HTML, KIND_MEDIA, KIND_IMAGE, KIND_VIDEO, KIND_AVATAR, KIND_CLEAN]:
+    for kind in [KIND_HTML, KIND_MEDIA, KIND_IMAGE, KIND_VIDEO, KIND_AVATAR]:
         with _archive_index_lock:
             entries = idx[kind]
         if not entries:
@@ -5056,7 +4843,7 @@ def cmd_render_html(args: argparse.Namespace) -> int:
 # ── 子命令: all ─────────────────────────────────────────────────────────────
 # ============================================================================
 #
-# 按顺序跑 fetch-html → fetch-media → build-index。
+# 按顺序跑 fetch-html → fetch-media → clean-html → build-index。
 # 任何一步失败都继续往下走（保留失败列表供 --retry 用），但最终返回非零退出码。
 # ============================================================================
 
@@ -5064,7 +4851,7 @@ def cmd_all(args: argparse.Namespace) -> int:
     overall = 0
 
     safe_print("\n╔══════════════════════════════════════════════════════════╗")
-    safe_print("║  Phase 1/3: fetch-html                                   ║")
+    safe_print("║  Phase 1/4: fetch-html                                   ║")
     safe_print("╚══════════════════════════════════════════════════════════╝")
     a1 = argparse.Namespace(
         retry=False, force=False, file=None,
@@ -5073,7 +4860,7 @@ def cmd_all(args: argparse.Namespace) -> int:
     overall |= cmd_fetch_html(a1)
 
     safe_print("\n╔══════════════════════════════════════════════════════════╗")
-    safe_print("║  Phase 2/3: fetch-media                                  ║")
+    safe_print("║  Phase 2/4: fetch-media                                  ║")
     safe_print("╚══════════════════════════════════════════════════════════╝")
     a2 = argparse.Namespace(
         retry=False, force=False, file=None,
@@ -5082,10 +4869,16 @@ def cmd_all(args: argparse.Namespace) -> int:
     overall |= cmd_fetch_media(a2)
 
     safe_print("\n╔══════════════════════════════════════════════════════════╗")
-    safe_print("║  Phase 3/3: build-index                                  ║")
+    safe_print("║  Phase 3/4: clean-html                                   ║")
     safe_print("╚══════════════════════════════════════════════════════════╝")
-    a3 = argparse.Namespace()
-    overall |= cmd_build_index(a3)
+    a3 = argparse.Namespace(force=False)
+    overall |= cmd_clean_html(a3)
+
+    safe_print("\n╔══════════════════════════════════════════════════════════╗")
+    safe_print("║  Phase 4/4: build-index                                  ║")
+    safe_print("╚══════════════════════════════════════════════════════════╝")
+    a4 = argparse.Namespace()
+    overall |= cmd_build_index(a4)
 
     safe_print("\n[all] 全部阶段完成")
     return overall
@@ -5125,13 +4918,12 @@ def build_parser() -> argparse.ArgumentParser:
   convert <dump_dir>      把外部 dump 转成本项目格式（自动建立 archive_index）
   render-html             从 JSON 渲染 wayback 风格 HTML
 
-重试失败项（12 个子选项）：
+重试失败项（10 个子选项）：
   retry --image-failed [/--image-failed-all]      单图重试
   retry --video-failed [/--video-failed-all]      单视频重试
   retry --avatar-failed [/--avatar-failed-all]    单头像重试
   retry --media-failed [/--media-failed-all]      整条 JSON 媒体重试
   retry --html-failed [/--html-failed-all]        HTML 重试
-  retry --clean-failed [/--clean-failed-all]      清洗重试
 
 维护工具：
   dedup                   去重重复媒体 + 更新 HTML 引用
@@ -5239,10 +5031,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="重试 _log/html_failed.txt")
     g.add_argument("--html-failed-all",   action="store_true", dest="html_failed_all",
                    help="重试 _log/html_failed_all.txt")
-    g.add_argument("--clean-failed",      action="store_true", dest="clean_failed",
-                   help="重试 _log/clean_failed.txt")
-    g.add_argument("--clean-failed-all",  action="store_true", dest="clean_failed_all",
-                   help="重试 _log/clean_failed_all.txt")
     p.set_defaults(func=cmd_retry)
 
     # rebuild-index  ★ 新子命令：从 .txt 文件 + 本地媒体重建 archive_index.json
@@ -5260,7 +5048,6 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except KeyboardInterrupt:
         safe_print("\n[中断] 用户取消")
-        save_negative_cache()
         return 130
 
 
