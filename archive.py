@@ -6,7 +6,7 @@ archive.py — IncandescenceReader 一体化存档工具
 合并了原本分散在 8 个脚本里的所有功能：
   fetch_json.py / 0037.py 的下载部分 → fetch-html
   fetch_media.py                    → fetch-media
-  0037.py 的清洗部分                → clean-html
+  0037.py 的清洗部分                 → clean-html
   build_index.py                    → build-index
   fetch_avatars.py                  → fetch-avatars
   dedup_media.py                    → dedup
@@ -169,8 +169,8 @@ WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
 DEFAULT_WORKERS_HTML   = 20
-DEFAULT_WORKERS_MEDIA  = 40
-DEFAULT_WORKERS_AVATAR = 35
+DEFAULT_WORKERS_MEDIA  = 35
+DEFAULT_WORKERS_AVATAR = 30
 DEFAULT_DELAY_HTML     = 0.3
 DEFAULT_DELAY_MEDIA    = 0.1
 DEFAULT_DELAY_AVATAR_RANGE = (0.03, 0.15)
