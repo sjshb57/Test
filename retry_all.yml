@@ -9,6 +9,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: 检出仓库
