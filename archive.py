@@ -143,24 +143,24 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 5   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 60.0
+MAX_BACKOFF        = 12.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (5, 40)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (5, 60)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (5, 60)   # wayback HTML
+MEDIA_TIMEOUT_IMAGE  = (3, 8)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
-DEFAULT_WORKERS_HTML   = 7
-DEFAULT_WORKERS_MEDIA  = 8
-DEFAULT_WORKERS_AVATAR = 4
-DEFAULT_DELAY_HTML     = 0.8
-DEFAULT_DELAY_MEDIA    = 0.3
-DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
+DEFAULT_WORKERS_HTML   = 20
+DEFAULT_WORKERS_MEDIA  = 35
+DEFAULT_WORKERS_AVATAR = 30
+DEFAULT_DELAY_HTML     = 0.4
+DEFAULT_DELAY_MEDIA    = 0.15
+DEFAULT_DELAY_AVATAR_RANGE = (0.03, 0.20)
 
 # 索引/渲染
 TEXT_MAX = 500
@@ -186,10 +186,10 @@ def safe_print(msg: str) -> None:
 
 def get_session() -> requests.Session:
     """每线程一个 Session，复用 TCP/TLS 连接（减少握手，降低被识别为爬虫的风险）。"""
-    s = getattr(_session_local, "session", None)
+    s = getattr(_session_local, "session"， None)
     if s is None:
         s = requests.Session()
-        s.headers.update(HEADERS)
+        s.headers。update(HEADERS)
         _session_local.session = s
     return s
 
