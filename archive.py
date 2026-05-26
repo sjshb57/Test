@@ -143,24 +143,24 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 5   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 60.0
+MAX_BACKOFF        = 12.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (5, 40)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (5, 60)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (5, 60)   # wayback HTML
+MEDIA_TIMEOUT_IMAGE  = (3, 8)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
-DEFAULT_WORKERS_HTML   = 7
-DEFAULT_WORKERS_MEDIA  = 8
-DEFAULT_WORKERS_AVATAR = 4
-DEFAULT_DELAY_HTML     = 0.8
-DEFAULT_DELAY_MEDIA    = 0.3
-DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
+DEFAULT_WORKERS_HTML   = 20
+DEFAULT_WORKERS_MEDIA  = 35
+DEFAULT_WORKERS_AVATAR = 30
+DEFAULT_DELAY_HTML     = 0.4
+DEFAULT_DELAY_MEDIA    = 0.2
+DEFAULT_DELAY_AVATAR_RANGE = (0.03, 0.20)
 
 # 索引/渲染
 TEXT_MAX = 500
@@ -1409,10 +1409,6 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
     # 1. 剥旧 Source
     html_text = strip_existing_source_comments(html_text)
 
-    # 从 source_url 提取快照时间戳，用于构造图片预期文件名
-    _ts_m = re.search(r'/web/(\d{14})', source_url)
-    snapshot_ts = _ts_m.group(1) if _ts_m else ""
-
     # 2. script 清理
     html_text = re.sub(
         r"(<script[^>]*>)(.*?)(</script>)",
@@ -1454,17 +1450,6 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
             fn = media_index.find_image(basename)
             if fn:
                 return f'{prefix}../image/{fn}{suffix}'
-            # 没有本地记录 → 构造预期文件名（与 fetch-media 下载时一致）
-            if snapshot_ts:
-                # 从原始 pbs URL 构造安全文件名
-                _orig = re.search(r'im_/(https?://.*)', src_url)
-                _pbs_url = _orig.group(1) if _orig else src_url
-                _parsed = urlparse(_pbs_url)
-                _fbase = re.sub(r'[^\w\-_.]', '_',
-                                (_parsed.netloc + _parsed.path).strip('/'))[:120]
-                if not _fbase.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                    _fbase += ext_from_url(_pbs_url)
-                return f'{prefix}../image/{snapshot_ts}_{_fbase}{suffix}'
         return match.group(0)
 
     html_text = re.sub(
@@ -1486,8 +1471,11 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
     for tag in soup.find_all("div", id="jsonview"):
         tag.decompose()
 
-    # 图片：现在所有图片都已替换为本地路径（有记录用真实名，没记录用预期名）
-    # 不再需要删除 wayback 地址的图片标签，前端 onerror 处理文件不存在的情况
+    # 图片：fn=None 时 src 仍为 wayback 地址 → 删掉，防止破图
+    for tag in soup.find_all("img", class_="tweet-image"):
+        src = tag.get("src", "")
+        if "web.archive.org" in src or src.startswith("http"):
+            tag.decompose()
 
     # 头像：已始终替换为预期本地路径 ../avatar/avatar_<pid>.{ext}
 
@@ -4958,7 +4946,6 @@ def build_parser() -> argparse.ArgumentParser:
     # clean-html
     p = sub.add_parser("clean-html", help="清洗 HTML，重写媒体路径为本地引用")
     p.add_argument("--force", action="store_true", help="忽略已清洗标记，全部重新清洗")
-    p.add_argument("--workers", type=int, default=4, help="并发线程数（默认 4）")
     p.set_defaults(func=cmd_clean_html)
 
     # build-index
