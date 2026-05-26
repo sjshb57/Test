@@ -143,7 +143,7 @@ HEADERS = {
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 2   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
 MAX_BACKOFF        = 15.0
@@ -152,7 +152,7 @@ MAX_BACKOFF        = 15.0
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
 MEDIA_TIMEOUT_IMAGE  = (3, 8)   # 图片/头像
 MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (3, 10)   # wayback HTML
+WAYBACK_HTML_TIMEOUT = (5, 10)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
 DEFAULT_WORKERS_HTML   = 20
