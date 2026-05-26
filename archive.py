@@ -150,9 +150,9 @@ MAX_BACKOFF        = 12.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (3, 10)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (5, 10)   # wayback HTML
+MEDIA_TIMEOUT_IMAGE  = (3, 7)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (3, 10)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (5, 8)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
 DEFAULT_WORKERS_HTML   = 10
