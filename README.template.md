@@ -9,7 +9,7 @@
 
 ### 爬取脚本
 
-存档由 [IncandescenceArchiver](https://github.com/sjshb57/Test) 自动抓取，
+存档由 [IncandescenceArchiver](https://github.com/sjshb57/IncandescenceArchiver) 自动抓取，
 基于 GitHub Actions 定期增量更新。
 
 ### 阅读器
