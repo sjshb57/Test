@@ -142,7 +142,7 @@ HEADERS = {
 }
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
-# 重试 / 退避
+## 重试 / 退避
 REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
@@ -1504,8 +1504,7 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
                 src_tag.decompose()
             new_source = soup.new_tag("source", src=f"../video/{local_vname}", type="video/mp4")
             video_tag.append(new_source)
-        else:
-            video_tag.decompose()
+        # 没有本地文件：保留 video 标签（wayback URL），前端检测到 http src 直接删，不发请求
 
     # 6. prettify + 去多余空行
     try:
@@ -1531,6 +1530,77 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) ->
 
     # 7. 顶部写入恰好 1 行 Source 注释
     return f"<!-- Source: {source_url} -->\n" + cleaned
+
+
+def _replace_paths_only(html_text: str, source_url: str, media_index: MediaIndex) -> str:
+    """
+    已清洗过的 HTML 再次处理时，只替换媒体路径，不重跑 BS4/prettify。
+    防止多次 prettify 导致 CSS 缩进累积或格式混乱。
+    """
+    # 剥旧 Source 注释（单行）
+    html_text = strip_existing_source_comments(html_text)
+
+    # 头像：直接构造本地路径
+    def avatar_replacer(match: re.Match) -> str:
+        tag = match.group(0)
+        src_m = re.search(
+            r'src="(https://web\.archive\.org/web/\d+im_/https://[^"]*profile_images/[^"]+)"',
+            tag,
+        )
+        if not src_m:
+            return tag
+        src_url = src_m.group(1)
+        pid = extract_profile_image_id(src_url)
+        if not pid:
+            return tag
+        ext = ".png" if ".png" in src_url.lower() else (
+              ".gif" if ".gif" in src_url.lower() else ".jpg")
+        return tag.replace(src_m.group(0), f'src="../avatar/avatar_{pid}{ext}"')
+
+    html_text = re.sub(
+        r'<img\s[^>]*src="https://web\.archive\.org/web/\d+im_/https://[^"]*profile_images/[^"]+"[^>]*/?>',
+        avatar_replacer,
+        html_text,
+    )
+
+    # 图片：有 media_index 记录就替换，否则保持原样（已清洗过的 wayback URL img 已被删）
+    def image_replacer(match: re.Match) -> str:
+        prefix  = match.group(1)
+        src_url = match.group(2)
+        suffix  = match.group(3)
+        basename = extract_image_basename(src_url)
+        if basename:
+            fn = media_index.find_image(basename)
+            if fn:
+                return f'{prefix}../image/{fn}{suffix}'
+        return match.group(0)
+
+    html_text = re.sub(
+        r'(<img\s[^>]*class="tweet-image[^"]*"[^>]*src=")(https://web\.archive\.org/web/\d+im_/[^"]+)(")',
+        image_replacer, html_text,
+    )
+    html_text = re.sub(
+        r'(<img\s[^>]*src=")(https://web\.archive\.org/web/\d+im_/[^"]+)("[^>]*class="tweet-image[^"]*")',
+        image_replacer, html_text,
+    )
+
+    # 视频：已清洗的 HTML 里 source.src 可能是 wayback URL（本地没有时保留的）
+    def video_src_replacer(match: re.Match) -> str:
+        src_url = match.group(1)
+        media_key = extract_video_media_key(src_url)
+        if media_key:
+            local_vname = media_index.find_video(media_key)
+            if local_vname:
+                return f'src="../video/{local_vname}"'
+        return match.group(0)
+
+    html_text = re.sub(
+        r'src="(https://web\.archive\.org/web/\d+[^"]*video[^"]+)"',
+        video_src_replacer,
+        html_text,
+    )
+
+    return f"<!-- Source: {source_url} -->\n" + html_text
 # ============================================================================
 # ── 子命令: fetch-html ──────────────────────────────────────────────────────
 # ============================================================================
@@ -1870,6 +1940,8 @@ def _download_one_avatar(item: dict, snapshot_ts: str, media_index: MediaIndex,
 
 def cmd_fetch_media(args: argparse.Namespace) -> int:
     """子命令入口：从 json/ 下载所有引用的媒体。"""
+    # kinds: {'image','video','avatar'} 子集，None 表示全部（由 fetch-image/fetch-video 设置）
+    kinds = getattr(args, 'kinds', None)
     ensure_output_dirs()
     load_archive_index()
     install_sigint_handler()
@@ -1995,6 +2067,8 @@ def cmd_fetch_media(args: argparse.Namespace) -> int:
         any_fail = False
 
         for it in images:
+            if kinds is not None and 'image' not in kinds:
+                break
             if delay > 0:
                 time.sleep(delay)
             ok, msg = _download_one_image(it, snapshot_ts, media_index, force)
@@ -2006,6 +2080,8 @@ def cmd_fetch_media(args: argparse.Namespace) -> int:
                 any_fail = True
 
         for it in videos:
+            if kinds is not None and 'video' not in kinds:
+                break
             if delay > 0:
                 time.sleep(delay)
             ok, msg = _download_one_video(it, snapshot_ts, media_index, force)
@@ -2017,6 +2093,8 @@ def cmd_fetch_media(args: argparse.Namespace) -> int:
                 any_fail = True
 
         for it in avatars:
+            if kinds is not None and 'avatar' not in kinds:
+                break
             if delay > 0:
                 time.sleep(min(delay, 0.2))
             ok, msg = _download_one_avatar(it, snapshot_ts, media_index, force)
@@ -2163,6 +2241,18 @@ def _collect_all_avatars_from_json() -> list[dict]:
 
     out = list(by_pid.values()) + list(by_user_no_pid.values())
     return out
+
+
+def cmd_fetch_image(args: argparse.Namespace) -> int:
+    """子命令入口：只下载图片（等价于 fetch-media 只处理 image 类型）。"""
+    args.kinds = {'image'}
+    return cmd_fetch_media(args)
+
+
+def cmd_fetch_video(args: argparse.Namespace) -> int:
+    """子命令入口：只下载视频（等价于 fetch-media 只处理 video 类型）。"""
+    args.kinds = {'video'}
+    return cmd_fetch_media(args)
 
 
 def cmd_fetch_avatars(args: argparse.Namespace) -> int:
@@ -2342,8 +2432,13 @@ def cmd_clean_html(args: argparse.Namespace) -> int:
             continue
 
         source_url = _extract_source_url_from_filename(fname)
+        already_cleaned = _is_html_cleaned(path)
         try:
-            cleaned = clean_html_text(content, source_url, media_index)
+            if already_cleaned:
+                # 已清洗过：只替换路径，不重跑 BS4/prettify（防止多次格式化累积）
+                cleaned = _replace_paths_only(content, source_url, media_index)
+            else:
+                cleaned = clean_html_text(content, source_url, media_index)
         except Exception as e:
             safe_print(f"[{i}/{total}] ✗ {fname}  清洗失败：{type(e).__name__}: {e}")
             failed += 1
@@ -4936,6 +5031,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS_MEDIA)
     p.add_argument("--delay",   type=float, default=DEFAULT_DELAY_MEDIA)
     p.set_defaults(func=cmd_fetch_media)
+
+    # fetch-image
+    p = sub.add_parser("fetch-image", help="只下载图片")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS_MEDIA)
+    p.add_argument("--delay",   type=float, default=DEFAULT_DELAY_MEDIA)
+    p.add_argument("--force",   action="store_true")
+    p.set_defaults(func=cmd_fetch_image, retry=False, file=None)
+
+    # fetch-video
+    p = sub.add_parser("fetch-video", help="只下载视频")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS_MEDIA)
+    p.add_argument("--delay",   type=float, default=DEFAULT_DELAY_MEDIA)
+    p.add_argument("--force",   action="store_true")
+    p.set_defaults(func=cmd_fetch_video, retry=False, file=None)
 
     # fetch-avatars
     p = sub.add_parser("fetch-avatars", help="单独重下头像（修复用）")

@@ -1727,8 +1727,14 @@ function fixImagesInFrame(iframe) {
       if (embedded && embedded.contains(video)) return;
       // 从 source src 提取 media_key
       const srcEl = video.querySelector('source');
-      const vKey = srcEl ? extractVideoKey(srcEl.getAttribute('src') || '') : '';
+      const src = srcEl ? (srcEl.getAttribute('src') || '') : '';
+      const vKey = srcEl ? extractVideoKey(src) : '';
       if (!wantedVideoKeys.includes(vKey)) {
+        video.remove();
+        return;
+      }
+      // src 是网址（非本地路径）→ 直接删，不发网络请求
+      if (src.startsWith('http://') || src.startsWith('https://')) {
         video.remove();
       }
     });
