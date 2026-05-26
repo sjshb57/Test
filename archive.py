@@ -150,8 +150,8 @@ MAX_BACKOFF        = 12.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (3, 7)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (3, 10)   # 视频文件可能大
+MEDIA_TIMEOUT_IMAGE  = (3, 10)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (3, 12)   # 视频文件可能大
 WAYBACK_HTML_TIMEOUT = (5, 8)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
@@ -159,8 +159,8 @@ DEFAULT_WORKERS_HTML   = 10
 DEFAULT_WORKERS_MEDIA  = 35
 DEFAULT_WORKERS_AVATAR = 30
 DEFAULT_DELAY_HTML     = 0.4
-DEFAULT_DELAY_MEDIA    = 0.2
-DEFAULT_DELAY_AVATAR_RANGE = (0.03, 0.20)
+DEFAULT_DELAY_MEDIA    = 0.3
+DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.20)
 
 # 索引/渲染
 TEXT_MAX = 500
