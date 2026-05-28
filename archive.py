@@ -142,6 +142,11 @@ HEADERS = {
 }
 HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 
+# Cloudflare Workers 代理（可选）
+# 设置环境变量 TWITTER_PROXY_BASE=https://your-worker.workers.dev
+# 可让 Actions 通过代理访问 pbs.twimg.com / video.twimg.com
+PROXY_BASE: str = os.environ.get("TWITTER_PROXY_BASE", "").rstrip("/")
+
 # 重试 / 退避
 REQUEST_ATTEMPTS   = 3   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
@@ -1005,6 +1010,18 @@ def build_pbs_image_variants(source_url: str) -> list[str]:
     return variants
 
 
+def maybe_proxy(url: str) -> str:
+    """若配置了 TWITTER_PROXY_BASE，把 Twitter CDN 直链转为 Workers 代理 URL。
+    Wayback / 其他域名原样返回。"""
+    if not PROXY_BASE:
+        return url
+    parsed = urlparse(url)
+    if parsed.netloc in ("video.twimg.com", "pbs.twimg.com", "abs.twimg.com"):
+        path_qs = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        return f"{PROXY_BASE}/{parsed.netloc}{path_qs}"
+    return url
+
+
 def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> list[str]:
     """图片候选：原站画质回退 → wayback im_/if_/原始 三档回退。"""
     out: list[str] = []
@@ -1016,7 +1033,7 @@ def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> list[
             out.append(u)
 
     for v in build_pbs_image_variants(image_url):
-        add(v)
+        add(maybe_proxy(v))
     if snapshot_timestamp:
         add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{image_url}")
         add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{image_url}")
@@ -1034,10 +1051,10 @@ def build_video_candidate_urls(video_url: str, snapshot_timestamp: str) -> list[
             seen.add(u)
             out.append(u)
 
-    add(video_url)
+    add(maybe_proxy(video_url))
     parsed = urlparse(video_url)
     if parsed.netloc.endswith("video.twimg.com") and parsed.query:
-        add(urlunparse(parsed._replace(query="")))
+        add(maybe_proxy(urlunparse(parsed._replace(query=""))))
     if snapshot_timestamp:
         add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{video_url}")
         add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{video_url}")
@@ -1058,9 +1075,9 @@ def build_avatar_candidate_urls(avatar_url: str, snapshot_timestamp: str) -> lis
             out.append(u)
 
     if "_normal." in avatar_url:
-        add(avatar_url.replace("_normal.", "_400x400."))
-        add(avatar_url.replace("_normal.", "_bigger."))
-    add(avatar_url)
+        add(maybe_proxy(avatar_url.replace("_normal.", "_400x400.")))
+        add(maybe_proxy(avatar_url.replace("_normal.", "_bigger.")))
+    add(maybe_proxy(avatar_url))
 
     if snapshot_timestamp:
         if "_normal." in avatar_url:
