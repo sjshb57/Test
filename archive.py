@@ -881,20 +881,35 @@ def download_with_candidates(urls: list[str], filepath: str, log=None,
       SSL / 4xx (除 408/429) → download_stream 不重试，直接抛 → 这里走下一个候选
       408/429/5xx/超时/网络抖动 → download_stream 重试 5 次
 
+    优化：ConnectTimeout 后跳过同一 host 的后续候选（已超时的 host 不可能突然恢复）
     """
     last_exc: Exception | None = None
-    tried = 0
+    timed_out_hosts: set[str] = set()
 
     for i, url in enumerate(urls, 1):
-        tried += 1
+        host = urlparse(url).netloc
+        if host in timed_out_hosts:
+            if log:
+                log(f"  [跳过 {i}/{len(urls)}] {url}（{host} 连接已超时）")
+            continue
+
+        if log and i > 1:
+            log(f"  [候选 {i}/{len(urls)}] {url}")
         try:
-            if log and tried > 1:
-                log(f"  [候选 {i}/{len(urls)}] {url}")
             size = download_stream(url, filepath, log=log, headers=headers, timeout=timeout)
             return size, url
+        except requests.exceptions.ConnectTimeout as e:
+            timed_out_hosts.add(host)
+            last_exc = e
+            if log:
+                log(f"  [✗ 候选 {i}] ConnectTimeout，{host} 后续候选将跳过")
+            continue
         except Exception as e:
             last_exc = e
+            if log:
+                log(f"  [✗ 候选 {i}] {type(e).__name__}: {str(e)[:120]}")
             continue
+
     if last_exc:
         raise last_exc
     raise RuntimeError("候选 URL 列表为空")
