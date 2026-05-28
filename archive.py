@@ -989,7 +989,7 @@ def ext_from_url(url: str) -> str:
 # ============================================================================
 
 def build_pbs_image_variants(source_url: str) -> list[str]:
-    """pbs.twimg.com 图片：orig → 4096x4096 → large → medium → small → 无参数。"""
+    """pbs.twimg.com 图片：优先带扩展名直链 → orig → large 等参数变体 → 无参数。"""
     variants: list[str] = []
     seen: set[str] = set()
 
@@ -1008,6 +1008,13 @@ def build_pbs_image_variants(source_url: str) -> list[str]:
         if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
             format_hint = format_hint or suffix.lstrip(".")
             normalized_path = parsed.path[: -len(suffix)]
+            # 带扩展名的直链最可靠，放第一位
+            add(source_url)
+        elif format_hint:
+            # 原始 URL 是 ?format=jpg 形式，构造带扩展名的版本放第一位
+            add(urlunparse(parsed._replace(
+                path=normalized_path + "." + format_hint, query=""
+            )))
 
         if format_hint:
             for name_hint in ("orig", "4096x4096", "large", "medium", "small", "900x900"):
