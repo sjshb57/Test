@@ -2561,7 +2561,13 @@ function jumpToPost(dayKey, file, tweetId) {
   if (item && item.is_reply) {
     const conv = item.conversation_id ? idIndex[item.conversation_id] : null;
     const belongsToOwnMain = conv && !conv.is_reply && !conv.is_virtual;
-    if (belongsToOwnMain) { targetTab = 'tweets'; isReplyCard = true; }
+    if (belongsToOwnMain) {
+      targetTab = 'tweets'; isReplyCard = true;
+      // 回复卡片挂在主推文那天渲染，而主推文可能与回复不在同一天，
+      // 必须用主推文的日期 selectDay，否则当前渲染的那天里没有这张回复卡片，定位会失败
+      const cd = utcToLocal(conv.timestamp);
+      if (cd && cd.localDate) dayKey = cd.localDate;
+    }
     else { targetTab = 'replies'; }
   }
   if (activeTab !== targetTab) switchTab(targetTab);
