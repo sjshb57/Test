@@ -1084,6 +1084,26 @@ def build_video_candidate_urls(video_url: str, snapshot_timestamp: str) -> list[
     return out
 
 
+# 全站共享头像池（home 仓库 GitHub Pages，走 CDN）。
+# 下头像前先查这里，命中则秒取，未命中(404)自动回退 Wayback。
+# 设环境变量 AVATAR_POOL_BASE="" 可关闭此优化。
+AVATAR_POOL_BASE = os.environ.get(
+    "AVATAR_POOL_BASE",
+    "https://twitterarchiver.github.io/home/avatars",
+).rstrip("/")
+
+
+def build_avatar_pool_urls(pid: str, ext: str) -> list[str]:
+    """全站共享头像池候选（作为最优先候选，未命中会自动回退到 Wayback）。"""
+    if not pid or not AVATAR_POOL_BASE:
+        return []
+    out = [f"{AVATAR_POOL_BASE}/avatar_{pid}{ext}"]
+    # 池子若统一用 .jpg 存，补一个 .jpg 兜底
+    if ext.lower() != ".jpg":
+        out.append(f"{AVATAR_POOL_BASE}/avatar_{pid}.jpg")
+    return out
+
+
 def build_avatar_candidate_urls(avatar_url: str, snapshot_timestamp: str) -> list[str]:
     """
     头像候选：原站 400x400（高画质）→ bigger → normal → 原样 → wayback 回退。
@@ -1964,10 +1984,12 @@ def _download_one_avatar(item: dict, snapshot_ts: str, media_index: MediaIndex,
         set_status(KIND_AVATAR, url, STATUS_DONE)
         return True, f"复用本地（按 {hit} 命中）"
 
-    candidates = build_avatar_candidate_urls(url, snapshot_ts)
     ext = ext_from_url(url)
     fname = f"avatar_{pid}{ext}"
     fpath = os.path.join(AVATAR_DIR, fname)
+
+    # 先查全站共享头像池（GitHub CDN，快），命中直接用；未命中(404)自动回退 Wayback
+    candidates = build_avatar_pool_urls(pid, ext) + build_avatar_candidate_urls(url, snapshot_ts)
 
     try:
         size, _used = download_with_candidates(candidates, fpath, log=safe_print,
