@@ -1282,6 +1282,9 @@ async function loadProfile() {
     if (!r.ok) return;
     const c = await r.json();
     document.getElementById('p-name').textContent     = c.name     || '';
+    // 页面标题随账号动态变化：「账号名 · IncandescenceReader」
+    const _disp = c.name || c.username || '';
+    if (_disp) document.title = _disp + ' · IncandescenceReader';
     document.getElementById('p-username').textContent = c.username || '';
     document.getElementById('p-bio').innerHTML      = renderBioWithEntities(c.bio || '', c.bio_entities);
     // 保存当前账号 username（去 @ 转小写）—— 用于 reply-card 识别主人 vs 外人
@@ -2877,7 +2880,6 @@ function openShare(tweetId, file) {
   const rows = [
     twitterUrl ? { label: '推特原链接', value: twitterUrl } : null,
     tweetId    ? { label: '推文 ID',    value: tweetId } : null,
-    file       ? { label: '文件名',     value: file } : null,
     locateUrl  ? { label: '存档定位链接（浏览器打开）', value: locateUrl } : null,
     shortCode  ? { label: '定位短码（粘贴到搜索框）', value: shortCode } : null,
   ].filter(Boolean);
