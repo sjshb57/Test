@@ -168,7 +168,7 @@ DEFAULT_DELAY_MEDIA    = 0.3
 DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
 
 # 索引/渲染
-TEXT_MAX = 500
+TEXT_MAX = 10000
 
 # 媒体短响应阈值（小于这个字节数视为限速 / 截断）
 MEDIA_MIN_SIZE = 500
