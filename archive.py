@@ -2896,9 +2896,11 @@ def _bi_extract_from_json(json_data: dict, tweet_id_index: dict | None = None) -
         "embedded_video_keys":     [],
         "remove_urls":             [],
         "embedded_remove_urls":    [],
+        "raw_text":                "",
     }
     data     = json_data.get("data", {})
     includes = json_data.get("includes", {})
+    result["raw_text"]        = (data.get("text", "") or "")[:TEXT_MAX]
     result["tweet_id"]        = str(data.get("id", ""))
     result["conversation_id"] = str(data.get("conversation_id", ""))
     for ref in data.get("referenced_tweets", []):
@@ -2956,6 +2958,27 @@ def _bi_extract_from_json(json_data: dict, tweet_id_index: dict | None = None) -
                     result["embedded_basenames"].append(mk_to_image_basename[k])
                 if k in mk_to_video_key:
                     result["embedded_video_keys"].append(mk_to_video_key[k])
+
+    if ref_ids:
+        ref_type_by_id = {str(r.get("id", "")): r.get("type", "")
+                          for r in data.get("referenced_tweets", [])}
+        users_by_id = {str(u.get("id", "")): u for u in includes.get("users", []) or []}
+        inc_by_id = {str(t.get("id", "")): t for t in includes.get("tweets", []) or []}
+        for _prio in ("retweeted", "quoted", "replied_to"):
+            hit = next((i for i in ref_ids if ref_type_by_id.get(i) == _prio), "")
+            rt = inc_by_id.get(hit) if hit else None
+            if not rt:
+                continue
+            au = users_by_id.get(str(rt.get("author_id", "")), {}) or {}
+            result["embedded"] = {
+                "author_name":     au.get("name", "") or "",
+                "author_username": ("@" + str(au["username"]).lstrip("@")) if au.get("username") else "",
+                "author_avatar":   au.get("profile_image_url", "") or "",
+                "body_text":       (rt.get("text", "") or "")[:TEXT_MAX],
+                "tweet_id":        str(rt.get("id", "") or ""),
+                "timestamp":       rt.get("created_at", "") or "",
+            }
+            break
 
     # 祖先链追溯
     if tweet_id_index:
@@ -3611,7 +3634,8 @@ def cmd_build_index(args: argparse.Namespace) -> int:
             s = re.sub(r"\n[ \t]+", "\n", s)
             return s.strip()
 
-        clean_body = clean_urls(render_data["body_text"], meta.get("remove_urls", []))
+        raw_body = meta.get("raw_text") or render_data["body_text"]
+        clean_body = clean_urls(raw_body, meta.get("remove_urls", []))
         clean_text = clean_urls(text,                     meta.get("remove_urls", []))
 
         record = {
