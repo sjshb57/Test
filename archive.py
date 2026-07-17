@@ -930,7 +930,7 @@ _IMG_BASENAME_OLD_RE = re.compile(
 _IMG_URL_BASENAME_RE = re.compile(
     r"pbs\.twimg\.com/media/([A-Za-z0-9_\-]+?)(?:\.(?:jpg|png|gif|webp|jpeg))?$",
 )
-_VIDEO_KEY_RE  = re.compile(r"(?:amplify_video|ext_tw_video)[/_](\d+)|tweet_video[/_]([A-Za-z0-9]+)")
+_VIDEO_KEY_RE  = re.compile(r"(?:amplify_video|ext_tw_video)[/_](\d+)|tweet_video[/_]([A-Za-z0-9_-]+)")
 _AVATAR_PID_RE = re.compile(r"^avatar_(\d+)\.(?:jpg|png|gif|webp|jpeg)$", re.IGNORECASE)
 _PROFILE_URL_PID_RE = re.compile(r"/profile_images/(\d+)/")
 _TIMESTAMP_PREFIX_RE = re.compile(r"^(\d{14})_")
@@ -2569,9 +2569,8 @@ def _bi_build_video_index() -> dict:
         key=lambda f: (0 if "_video_twimg_com_" in f else 1, f),
     )
     for fname in fnames:
-        m = re.search(r"(?:amplify_video|ext_tw_video|tweet_video)[/_](\d+)", fname)
-        if m:
-            key = m.group(1)
+        key = extract_video_media_key(fname)
+        if key:
             if key not in index:
                 index[key] = f"../video/{fname}"
     return index
@@ -2828,12 +2827,8 @@ def _bi_media_lookup_for_json(json_data: dict):
             key = None
             for v in media.get("variants", []) or []:
                 if v.get("content_type") == "video/mp4":
-                    url = v.get("url", "")
-                    m = re.search(
-                        r"(?:amplify_video|ext_tw_video|tweet_video)[/_](\d+)", url,
-                    )
-                    if m:
-                        key = m.group(1)
+                    key = extract_video_media_key(v.get("url", ""))
+                    if key:
                         break
             if not key:
                 m = re.search(r"(\d+)$", mkey)
@@ -2939,12 +2934,8 @@ def _bi_extract_from_json(json_data: dict, tweet_id_index: dict | None = None) -
             key = None
             for v in media.get("variants", []) or []:
                 if v.get("content_type") == "video/mp4":
-                    url = v.get("url", "")
-                    m = re.search(
-                        r"(?:amplify_video|ext_tw_video|tweet_video)[/_](\d+)", url,
-                    )
-                    if m:
-                        key = m.group(1)
+                    key = extract_video_media_key(v.get("url", ""))
+                    if key:
                         break
             if not key:
                 m = re.search(r"(\d+)$", mkey)
