@@ -537,20 +537,25 @@ def _txt_add(path: str, item: str) -> bool:
 
 
 def _txt_remove(path: str, item: str) -> bool:
-    """从 set 移除该行并重写整个文件。返回是否真删了。"""
+    """从 set 移除该行并重写整个文件（保留其余行的原有顺序）。返回是否真删了。"""
     with _txt_sets_lock:
         s = _load_txt_set(path)
         if item not in s:
             return False
         s.discard(item)
-        # 重写整个文件（保留行顺序：因为我们不存原顺序，这里就按字典序）
-        # 实际上 set 本来无序，我们重写时按字典序产出稳定的输出
-        items_sorted = sorted(s)
     with _log_file_lock:
         try:
+            kept: list[str] = []
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if line.strip() == item:
+                            continue
+                        kept.append(line)
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                for x in items_sorted:
+                for x in kept:
                     f.write(x + "\n")
                 f.flush()
                 try:
