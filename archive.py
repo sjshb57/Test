@@ -46,6 +46,7 @@ archive.py — IncandescenceReader 一体化存档工具
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import html as html_module
 import json
 import os
@@ -3551,30 +3552,94 @@ def cmd_build_index(args: argparse.Namespace) -> int:
     if pinned_tweet_id:
         safe_print(f"置顶推文 tweet_id：{pinned_tweet_id}")
 
-    # 如果 profile.json 里还没有 bio_entities，从 JSON 文件里提取主用户的 description entities
-    if not _prof.get("bio_entities") and os.path.isdir(JSON_DIR):
+    # 从 JSON 里取主用户最新一份 profile 快照，刷新 profile.json。
+    # json 文件名以快照时间戳开头，必须从新到旧找 —— 早期版本按 sorted() 正序取，
+    # 拿到的是最老的 bio/头像，和用户手填的当前 bio 对不上（entities 偏移全错）。
+    if os.path.isdir(JSON_DIR):
         _username = _prof.get("username", "").lstrip("@").lower()
-        _found_entities = False
-        for _jfname in sorted(os.listdir(JSON_DIR)):
-            if not _jfname.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(JSON_DIR, _jfname), encoding="utf-8") as _jf:
-                    _jdata = json.load(_jf)
-                for _user in _jdata.get("includes", {}).get("users", []):
-                    if _user.get("username", "").lower() == _username:
-                        _ents = _user.get("entities", {}).get("description", {})
-                        if _ents.get("mentions") or _ents.get("urls"):
-                            _prof["bio_entities"] = _ents
-                            with open(_profile_path, "w", encoding="utf-8") as _pfw:
-                                json.dump(_prof, _pfw, ensure_ascii=False, indent=2)
-                            safe_print(f"[build-index] 已更新 profile.json bio_entities")
-                            _found_entities = True
+        _me_user = None
+        if _username:
+            for _jfname in sorted(os.listdir(JSON_DIR), reverse=True):
+                if not _jfname.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(JSON_DIR, _jfname), encoding="utf-8") as _jf:
+                        _jdata = json.load(_jf)
+                    for _user in _jdata.get("includes", {}).get("users", []):
+                        if _user.get("username", "").lower() == _username:
+                            _me_user = _user
                             break
-            except Exception:
-                pass
-            if _found_entities:
-                break
+                except Exception:
+                    pass
+                if _me_user:
+                    break
+        if _me_user:
+            _changed = []
+            _ents = _me_user.get("entities", {}).get("description", {}) or {}
+            if _ents != (_prof.get("bio_entities") or {}):
+                _prof["bio_entities"] = _ents
+                _changed.append("bio_entities")
+
+            # name / bio / location / link 以最新快照为准，直接覆盖：
+            # 这些字段是从用户主页原样抓来的，不存在需要保留的人工润色。
+            _dsc_ents = _me_user.get("entities", {}).get("description", {}) or {}
+            _url_ents = _me_user.get("entities", {}).get("url", {}) or {}
+
+            def _resolve_with_entities(text, ents):
+                """用 entities.urls 里的 expanded_url 展开 text 里的 t.co。"""
+                if not text:
+                    return text
+                for u in (ents.get("urls") or []):
+                    if u.get("url") and u.get("expanded_url"):
+                        text = text.replace(u["url"], u["expanded_url"])
+                return text
+
+            _new_name = _me_user.get("name", "")
+            _new_bio = _resolve_with_entities(_me_user.get("description", ""), _dsc_ents)
+            _new_loc = _me_user.get("location", "")
+            _new_link = _resolve_with_entities(_me_user.get("url", ""), _url_ents)
+
+            for _k, _v in (("name", _new_name), ("bio", _new_bio),
+                          ("location", _new_loc), ("link", _new_link)):
+                if _v and _prof.get(_k) != _v:
+                    _prof[_k] = _v
+                    _changed.append(_k)
+
+            # 头像：文件名固定 avatar.{ext}，内容随最新快照更新；
+            # 推文卡片里历史头像（avatar_{pid}.*）不动，各自随所在推文的时间固定。
+            _av_url = _me_user.get("profile_image_url", "")
+            if _av_url and _av_url != _prof.get("_avatar_source"):
+                _av_url_orig = _av_url.replace("_normal.", ".").replace("_bigger.", ".")
+                _ext = os.path.splitext(_av_url_orig.split("?")[0])[1] or ".jpg"
+                if True:
+                    try:
+                        _tmp_path = os.path.join(AVATAR_DIR, f"avatar{_ext}.new")
+                        _size, _used = download_with_candidates(
+                            [_av_url_orig, _av_url], _tmp_path, log=None,
+                        )
+                        if _size > 0:
+                            _final = os.path.join(AVATAR_DIR, f"avatar{_ext}")
+                            os.replace(_tmp_path, _final)
+                            # 旧扩展名的文件如果和新的不同，清掉避免混淆
+                            for _old_ext in (".jpg", ".jpeg", ".png", ".webp"):
+                                if _old_ext != _ext:
+                                    _stale = os.path.join(AVATAR_DIR, f"avatar{_old_ext}")
+                                    if os.path.exists(_stale):
+                                        os.remove(_stale)
+                            _prof["avatar"] = f"avatar/avatar{_ext}"
+                            _prof["_avatar_source"] = _av_url
+                            _changed.append("avatar")
+                    except Exception as _e:
+                        safe_print(f"[build-index] 头像更新失败：{_e}")
+
+            if _changed:
+                try:
+                    with open(_profile_path, "w", encoding="utf-8") as _pfw:
+                        json.dump(_prof, _pfw, ensure_ascii=False, indent=2)
+                    safe_print(f"[build-index] profile.json 已按最新快照刷新："
+                               f"{', '.join(_changed)}")
+                except Exception as _e:
+                    safe_print(f"[build-index] profile.json 写入失败：{_e}")
 
     index_data: list[dict] = []
     no_date: list[str] = []
@@ -4162,6 +4227,619 @@ def _media_safe_local_name(media_url: str, ts: str, ext: str) -> str:
     return safe_filename(ts, media_url, ext)
 
 
+
+
+# ============================================================================
+# X 官方数据导出包（GDPR export）→ 本项目格式
+# convert 检测到 data/tweets.js 走这里；检测到 snapshots.json 走 download_archive dump。
+# 导出包只含本人数据：正文/媒体/回复关系齐全，但没有被回复推文的正文和对方头像。
+# ============================================================================
+_XE_YTD_PREFIX_RE = re.compile(r"^\s*window\.YTD\.[A-Za-z0-9_]+\.part\d+\s*=\s*", re.S)
+_XE_TCO_RE = re.compile(r"https://t\.co/[A-Za-z0-9]+")
+_XE_V1_TIME_FMT = "%a %b %d %H:%M:%S %z %Y"
+
+# X 的 media_key 前缀：3=photo 7/13=video 16=animated_gif
+_XE_MEDIA_KEY_PREFIX = {"photo": "3", "video": "7", "animated_gif": "16"}
+
+
+def _xe_load_ytd(path: str):
+    """读 X 导出包的 .js 文件（内容是 window.YTD.xxx.partN = [...] 的 JSON）。"""
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    return json.loads(_XE_YTD_PREFIX_RE.sub("", txt))
+
+
+def _xe_v1_time_to_iso(s: str) -> str:
+    """Sat Apr 25 12:38:29 +0000 2026 → 2026-04-25T12:38:29.000Z"""
+    try:
+        dt = datetime.strptime(s, _XE_V1_TIME_FMT).astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    except ValueError:
+        return ""
+
+
+def _xe_v1_time_to_ts(s: str) -> str:
+    """Sat Apr 25 12:38:29 +0000 2026 → 20260425123829（本项目文件名用）"""
+    try:
+        dt = datetime.strptime(s, _XE_V1_TIME_FMT).astimezone(timezone.utc)
+        return dt.strftime("%Y%m%d%H%M%S")
+    except ValueError:
+        return ""
+
+
+def _xe_is_export(path: str) -> bool:
+    """判断给定目录是不是 X 官方导出包。"""
+    for sub in ("", "data"):
+        if os.path.exists(os.path.join(path, sub, "tweets.js")):
+            return True
+    return False
+
+
+def _xe_export_data_dir(path: str) -> str:
+    if os.path.exists(os.path.join(path, "data", "tweets.js")):
+        return os.path.join(path, "data")
+    return path
+
+
+def _xe_account_info(data_dir: str) -> dict:
+    """从 account.js / profile.js 取本人信息。"""
+    info = {"id": "", "username": "", "name": "", "avatar": "", "bio": "",
+            "banner": "", "website": "", "location": ""}
+    p = os.path.join(data_dir, "account.js")
+    if os.path.exists(p):
+        try:
+            a = _xe_load_ytd(p)[0]["account"]
+            info["id"] = str(a.get("accountId", ""))
+            info["username"] = a.get("username", "")
+            info["name"] = a.get("accountDisplayName", "")
+        except Exception:
+            pass
+    p = os.path.join(data_dir, "profile.js")
+    if os.path.exists(p):
+        try:
+            pr = _xe_load_ytd(p)[0]["profile"]
+            info["avatar"] = pr.get("avatarMediaUrl", "")
+            info["banner"] = pr.get("headerMediaUrl", "")
+            _d = pr.get("description") or {}
+            info["bio"] = _d.get("bio", "")
+            info["website"] = _d.get("website", "")
+            info["location"] = _d.get("location", "")
+        except Exception:
+            pass
+    return info
+
+
+def _xe_collect_users(tweets: list) -> dict:
+    """从所有推文的 user_mentions 收集别人的 id/name/username。"""
+    users = {}
+    for t in tweets:
+        for um in (t.get("entities") or {}).get("user_mentions", []) or []:
+            uid = str(um.get("id_str") or um.get("id") or "")
+            if not uid:
+                continue
+            users.setdefault(uid, {
+                "id": uid,
+                "username": um.get("screen_name", ""),
+                "name": um.get("name", ""),
+            })
+    return users
+
+
+def _xe_expand_urls(text: str, ent: dict) -> str:
+    """把正文里的 t.co 短链换成 expanded_url；媒体占位符直接去掉。
+
+    导出包自带全部映射（entities.urls / extended_entities.media），无需联网。
+    """
+    mp = {}
+    for u in (ent.get("urls") or []):
+        if u.get("url"):
+            mp[u["url"]] = u.get("expanded_url") or u["url"]
+    for m in (ent.get("_media") or []):
+        if m.get("url"):
+            mp[m["url"]] = ""          # 媒体占位符：正文里不需要留链接
+    if not mp:
+        return text
+    return _XE_TCO_RE.sub(lambda x: mp.get(x.group(0), x.group(0)), text).strip()
+
+
+def _xe_build_media(t: dict) -> tuple[list, list]:
+    """extended_entities.media → (v2 的 includes.media, attachments.media_keys)"""
+    media, keys = [], []
+    ee = (t.get("extended_entities") or {}).get("media") or []
+    for m in ee:
+        mtype = m.get("type", "photo")
+        mid = str(m.get("id_str") or "")
+        if not mid:
+            continue
+        key = f"{_XE_MEDIA_KEY_PREFIX.get(mtype, '3')}_{mid}"
+        item = {"media_key": key, "type": mtype}
+        if mtype == "photo":
+            item["url"] = m.get("media_url_https") or m.get("media_url") or ""
+        else:
+            item["preview_image_url"] = m.get("media_url_https") or ""
+            variants = []
+            for v in ((m.get("video_info") or {}).get("variants") or []):
+                # 只留 mp4，跳过 m3u8：与 archive.py 其它路径一致
+                if v.get("content_type") == "video/mp4":
+                    try:
+                        _br = int(v.get("bitrate") or 0)
+                    except (TypeError, ValueError):
+                        _br = 0
+                    variants.append({
+                        "bit_rate": _br,
+                        "content_type": "video/mp4",
+                        "url": v.get("url", ""),
+                    })
+            item["variants"] = variants
+        media.append(item)
+        keys.append(key)
+    return media, keys
+
+
+def _xe_to_v2(t: dict, me: dict, users: dict) -> dict:
+    """一条 v1.1 导出推文 → 本项目吃的 X API v2 结构。"""
+    tid = str(t.get("id_str") or "")
+    ent = dict(t.get("entities") or {})
+    ee = (t.get("extended_entities") or {}).get("media") or []
+    ent["_media"] = ee
+    text = _xe_expand_urls(t.get("full_text", "") or "", ent)
+    ent.pop("_media", None)
+
+    media, keys = _xe_build_media(t)
+
+    refs = []
+    rid = t.get("in_reply_to_status_id_str")
+    if rid:
+        refs.append({"type": "replied_to", "id": str(rid)})
+    m = re.match(r"^RT @([A-Za-z0-9_]+):", text)
+    if m:
+        # 老式转推：导出包只有 "RT @x: 正文…" 一段文本，没有原推 id
+        pass
+
+    data = {
+        "id": tid,
+        "text": text,
+        "created_at": _xe_v1_time_to_iso(t.get("created_at", "")),
+        "author_id": me["id"],
+        "conversation_id": str(t.get("in_reply_to_status_id_str") or tid),
+        "lang": t.get("lang", ""),
+        "public_metrics": {
+            "retweet_count": int(t.get("retweet_count", 0) or 0),
+            "reply_count": 0,
+            "like_count": int(t.get("favorite_count", 0) or 0),
+            "quote_count": 0,
+        },
+    }
+    if refs:
+        data["referenced_tweets"] = refs
+    if keys:
+        data["attachments"] = {"media_keys": keys}
+    if ent.get("urls") or ent.get("user_mentions") or ent.get("hashtags"):
+        data["entities"] = {
+            k: v for k, v in ent.items()
+            if k in ("urls", "user_mentions", "hashtags") and v
+        }
+
+    inc_users = [{
+        "id": me["id"], "username": me["username"], "name": me["name"],
+        "profile_image_url": me.get("avatar", ""),
+    }]
+    for um in (t.get("entities") or {}).get("user_mentions", []) or []:
+        uid = str(um.get("id_str") or "")
+        if uid and uid != me["id"] and uid in users:
+            inc_users.append({
+                "id": uid,
+                "username": users[uid]["username"],
+                "name": users[uid]["name"],
+                "profile_image_url": "",
+            })
+    # 被回复对象：导出包没给它的 user 对象，靠 screen_name 兜一个
+    rsn = t.get("in_reply_to_screen_name")
+    ruid = str(t.get("in_reply_to_user_id_str") or "")
+    if rsn and ruid and not any(u["id"] == ruid for u in inc_users):
+        hit = users.get(ruid)
+        inc_users.append({
+            "id": ruid,
+            "username": rsn,
+            "name": (hit or {}).get("name", "") or rsn,
+            "profile_image_url": "",
+        })
+
+    includes = {"users": inc_users}
+    if media:
+        includes["media"] = media
+    return {"data": data, "includes": includes}
+
+
+def _xe_local_media_map(data_dir: str) -> dict:
+    """扫 *_media/ 目录：{tweet_id}-{原文件名} → 本地路径。"""
+    mp = {}
+    for sub in ("tweets_media", "deleted_tweets_media", "profile_media",
+                "community_tweet_media", "direct_messages_media"):
+        d = os.path.join(data_dir, sub)
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            mp[fn] = os.path.join(d, fn)
+    return mp
+
+
+def _xe_find_local(tid: str, url: str, local: dict) -> str:
+    """按 X 导出包命名规则 {tweet_id}-{basename} 找本地媒体文件。"""
+    if not url:
+        return ""
+    base = url.split("/")[-1].split("?")[0]
+    key = f"{tid}-{base}"
+    if key in local:
+        return local[key]
+    stem = base.rsplit(".", 1)[0]
+    for k, v in local.items():
+        if k.startswith(f"{tid}-") and stem in k:
+            return v
+    return ""
+
+
+def _xe_convert_export(export_dir, json_dir, image_dir, video_dir, avatar_dir,
+                   safe_filename, classify_url, log=print,
+                   include_deleted=True):
+    """主入口：把 X 导出包转成本项目的 json/ + image/ + video/ + avatar/。
+
+    返回 (写入的 json 数, 复制的媒体数, 需联网补下的视频 URL 列表)。
+    """
+    dd = _xe_export_data_dir(export_dir)
+    me = _xe_account_info(dd)
+    if not me["id"]:
+        log("[import-export] 读不到 account.js，无法确定账号身份")
+        return 0, 0, []
+
+    log(f"[import-export] X 官方导出包：@{me['username']}（{me['name']}）")
+
+    groups = [("tweets.js", False)]
+    if include_deleted:
+        groups.append(("deleted-tweets.js", True))
+
+    tweets = []
+    for fn, deleted in groups:
+        p = os.path.join(dd, fn)
+        if not os.path.exists(p):
+            continue
+        try:
+            arr = _xe_load_ytd(p)
+        except Exception as e:
+            log(f"[import-export] {fn} 解析失败：{e}")
+            continue
+        got = [x["tweet"] for x in arr if "tweet" in x]
+        for t in got:
+            t["_deleted"] = deleted
+        tweets += got
+        log(f"[import-export] {fn}: {len(got)} 条{'（已删除，Wayback 通常抓不到）' if deleted else ''}")
+
+    if not tweets:
+        log("[import-export] 没有可转换的推文")
+        return 0, 0, []
+
+    users = _xe_collect_users(tweets)
+    log(f"[import-export] 从 user_mentions 收集到 {len(users)} 个其他用户的显示名")
+
+    local = _xe_local_media_map(dd)
+    log(f"[import-export] 导出包内媒体文件：{len(local)} 个")
+
+    n_json = n_media = 0
+    pending_videos = []
+
+    for t in tweets:
+        tid = str(t.get("id_str") or "")
+        ts = _xe_v1_time_to_ts(t.get("created_at", ""))
+        if not tid or not ts:
+            continue
+        v2 = _xe_to_v2(t, me, users)
+        if t.get("_deleted"):
+            v2["data"]["_deleted"] = True
+
+        url = f"https://twitter.com/{me['username']}/status/{tid}"
+        jname = safe_filename(ts, url, ".json")
+        with open(os.path.join(json_dir, jname), "w", encoding="utf-8") as f:
+            json.dump(v2, f, ensure_ascii=False, separators=(",", ":"))
+        n_json += 1
+
+        for m in (v2["includes"].get("media") or []):
+            if m["type"] == "photo":
+                src_url = m.get("url", "")
+                lp = _xe_find_local(tid, src_url, local)
+                if lp:
+                    dst = os.path.join(image_dir, _media_safe_local_name(
+                        src_url, ts, os.path.splitext(lp)[1] or ".jpg"))
+                    if not os.path.exists(dst):
+                        shutil.copy2(lp, dst)
+                    n_media += 1
+            else:
+                # 视频：X 导出包只给缩略图，正片要按 variants URL 联网下
+                best, br = "", -1
+                for v in (m.get("variants") or []):
+                    try:
+                        _b = int(v.get("bit_rate") or 0)
+                    except (TypeError, ValueError):
+                        _b = 0
+                    if _b >= br:
+                        br, best = _b, v.get("url", "")
+                if best:
+                    pending_videos.append({"url": best, "ts": ts, "tid": tid})
+
+    # 本人头像 / banner：导出包 profile_media/ 里就有，按 URL 特征分辨
+    pm = os.path.join(dd, "profile_media")
+    if os.path.isdir(pm):
+        av_id = (me.get("avatar") or "").rstrip("/").split("/")[-1].split(".")[0]
+        bn_id = (me.get("banner") or "").rstrip("/").split("/")[-1]
+        for fn in sorted(os.listdir(pm)):
+            src = os.path.join(pm, fn)
+            ext = os.path.splitext(fn)[1] or ".jpg"
+            stem = os.path.splitext(fn)[0]
+            if av_id and av_id in fn:
+                shutil.copy2(src, os.path.join(avatar_dir, "avatar" + ext))
+                log(f"[import-export] 本人头像 → avatar/avatar{ext}")
+            elif bn_id and (bn_id in fn or "banner" in fn.lower()):
+                shutil.copy2(src, os.path.join(avatar_dir, "1500x500" + ext))
+                log(f"[import-export] 本人 banner → avatar/1500x500{ext}")
+            elif stem.endswith(me["id"]) or fn.startswith(me["id"]):
+                # 兜底：文件名带 account id 的，按尺寸猜（banner 通常更大）
+                dst = "1500x500" if os.path.getsize(src) > 120000 else "avatar"
+                shutil.copy2(src, os.path.join(avatar_dir, dst + ext))
+                log(f"[import-export] 本人 {dst} → avatar/{dst}{ext}")
+
+    _xe_write_profile(me, os.path.dirname(avatar_dir.rstrip("/")), avatar_dir, log)
+
+    log(f"[import-export] 写入 JSON {n_json} 条，复制媒体 {n_media} 个")
+    if pending_videos:
+        log(f"[import-export] 视频 {len(pending_videos)} 个需联网下载（导出包只含缩略图）")
+    return n_json, n_media, pending_videos
+
+
+
+
+def _xe_resolve_tco(url: str) -> str:
+    """把 t.co 短链还原成真实地址（跟随重定向）。失败返回原值。
+
+    注意不能带项目默认的 Referer: web.archive.org —— t.co 见到外站 Referer
+    会返回 JS 跳转页而不是 302，导致解析不出真实地址。
+    """
+    if not url or "t.co/" not in url:
+        return url
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"}
+    for method in ("head", "get"):
+        try:
+            r = getattr(requests, method)(url, headers=ua, allow_redirects=True,
+                                          timeout=20)
+            final = r.url or ""
+            if final and "t.co/" not in final:
+                return final
+            # t.co 有时用 JS 跳转，从页面里抠 URL
+            if method == "get":
+                m = re.search(r'URL=(https?://[^"\'>\s]+)', r.text or "")
+                if m and "t.co/" not in m.group(1):
+                    return m.group(1)
+        except Exception:
+            continue
+    return url
+
+
+def _xe_write_profile(me: dict, out_dir: str, avatar_dir: str, log=print) -> None:
+    """用导出包里的账号信息生成/更新 profile.json。
+
+    bio / link 里的 t.co 会还原成真实地址；bio_entities 交给 build-index
+    从 json/ 里取最新的。已存在的 profile.json 只补空字段，不覆盖已填内容。
+    """
+    path = os.path.join(out_dir, "profile.json")
+    prof = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                prof = json.load(f)
+        except Exception:
+            prof = {}
+
+    # 头像 / banner 用实际落盘的文件名（后缀可能不是 .jpg）
+    def _pick(prefix, cur):
+        if os.path.isdir(avatar_dir):
+            for fn2 in sorted(os.listdir(avatar_dir)):
+                if os.path.splitext(fn2)[0] == prefix:
+                    return f"avatar/{fn2}"
+        return cur or f"avatar/{prefix}.jpg"
+
+    _bio = me.get("bio", "") or ""
+    _link = me.get("website", "") or ""
+    _tco = sorted(set(_XE_TCO_RE.findall(_bio)) | ({_link} if "t.co/" in _link else set()))
+    if _tco:
+        log(f"[import-export] 还原 profile 里的 {len(_tco)} 个 t.co 短链 …")
+        for _u in _tco:
+            _real = _xe_resolve_tco(_u)
+            if _real != _u:
+                _bio = _bio.replace(_u, _real)
+                if _link == _u:
+                    _link = _real
+
+    fields = {
+        "name":     me.get("name", ""),
+        "username": "@" + me.get("username", "").lstrip("@"),
+        "bio":      _bio,
+        "location": me.get("location", ""),
+        "link":     _link,
+        "avatar":   _pick("avatar", prof.get("avatar")),
+        "banner":   _pick("1500x500", prof.get("banner")),
+        "pinned":   prof.get("pinned", ""),
+    }
+    changed = []
+    for k, v in fields.items():
+        if not prof.get(k) and v:
+            prof[k] = v
+            changed.append(k)
+        elif k in ("avatar", "banner") and v:
+            prof[k] = v          # 这两个跟随实际文件名
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(prof, f, ensure_ascii=False, indent=2)
+    if changed:
+        log(f"[import-export] profile.json 已填入：{', '.join(changed)}")
+    else:
+        log("[import-export] profile.json 已存在且字段齐全，未改动")
+
+def _xe_cdx_lookup(url: str, log=None) -> str:
+    """按单条推文 URL 查 CDX，返回最新快照的 timestamp；没有则返回 ""。"""
+    params = {
+        "url":       url,
+        "output":    "json",
+        "filter":    "mimetype:application/json",
+        "limit":     "-1",          # 取最新一条
+        "fl":        "timestamp",
+    }
+    try:
+        resp = get_session().get(CDX_BASE_URL, params=params, timeout=45)
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception:
+        return ""
+    if not isinstance(rows, list) or len(rows) < 2:
+        return ""
+    try:
+        return str(rows[-1][0])
+    except (IndexError, TypeError):
+        return ""
+
+
+def _xe_fill_replied(export_dir, json_dir, workers=6, log=print):
+    """把导出包里被回复/被引用的推文，从 Wayback 抓回来补进 json/。
+
+    X 导出包只给 in_reply_to_status_id_str + screen_name，没有对方正文。
+    但被回复的多是公开账号，其推文在 Wayback 上通常有 JSON 快照——
+    抓回来放进 json/，build-index 就会把它们变成虚拟条目，回复链即可还原。
+    """
+    dd = _xe_export_data_dir(export_dir)
+    tweets = []
+    for fn in ("tweets.js", "deleted-tweets.js"):
+        p = os.path.join(dd, fn)
+        if os.path.exists(p):
+            try:
+                tweets += [x["tweet"] for x in _xe_load_ytd(p) if "tweet" in x]
+            except Exception:
+                pass
+
+    targets, seen = [], set()
+    for t in tweets:
+        tid = t.get("in_reply_to_status_id_str")
+        sn = t.get("in_reply_to_screen_name")
+        if tid and sn and tid not in seen:
+            seen.add(tid)
+            targets.append((sn, str(tid)))
+        # 引用推文：正文里的 t.co 展开后指向 x.com/xxx/status/xxx
+        for u in (t.get("entities") or {}).get("urls", []) or []:
+            m = re.search(r"(?:twitter|x)\.com/([A-Za-z0-9_]+)/status/(\d+)",
+                          u.get("expanded_url", "") or "")
+            if m and m.group(2) not in seen:
+                seen.add(m.group(2))
+                targets.append((m.group(1), m.group(2)))
+
+    if not targets:
+        log("[import-export] 没有需要补的被回复推文")
+        return 0
+
+    # 已经在 json/ 里的就不用再抓
+    have = set()
+    for fn in os.listdir(json_dir):
+        m = re.search(r"_status_(\d+)\.json$", fn)
+        if m:
+            have.add(m.group(1))
+    todo = [(sn, tid) for sn, tid in targets if tid not in have]
+    log(f"[import-export] 被回复/被引用的推文 {len(targets)} 条，"
+        f"需补 {len(todo)} 条（{len(targets) - len(todo)} 条已在本地）")
+    if not todo:
+        return 0
+
+    done = nosnap = fail = 0
+    finished = 0
+    total = len(todo)
+    lock = threading.Lock()
+
+    def one(item):
+        nonlocal done, nosnap, fail, finished
+        sn, tid = item
+        url = f"https://twitter.com/{sn}/status/{tid}"
+        ts = _xe_cdx_lookup(url)
+        ok = False
+        if ts:
+            ok, _wb, _err = _process_one_snapshot((ts, url), False, 0.0)
+        with lock:
+            if not ts:
+                nosnap += 1
+                mark = "无快照"
+            elif ok:
+                done += 1
+                mark = "已补回"
+            else:
+                fail += 1
+                mark = "抓取失败"
+            finished += 1
+            log(f"  [{finished}/{total}] {mark}  @{sn}/status/{tid}")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(one, todo))
+
+    log(f"[import-export] 补回 {done} 条 · Wayback 无快照 {nosnap} 条 · 抓取失败 {fail} 条")
+    return done
+
+def cmd_import_export(args: argparse.Namespace) -> int:
+    """把 X 官方数据导出包（GDPR export）转换为本项目格式。"""
+    export_dir = args.export_dir
+    if not os.path.isdir(export_dir):
+        safe_print(f"[import-export] 目录不存在：{export_dir}")
+        return 1
+    if not _xe_is_export(export_dir):
+        safe_print(f"[import-export] {export_dir} 不像 X 官方导出包（找不到 data/tweets.js）")
+        if os.path.exists(os.path.join(export_dir, "snapshots.json")):
+            safe_print(f"[import-export] 它像是 download_archive.py 的 dump，请改用："
+                       f"python archive.py convert {export_dir}")
+        return 1
+    ensure_output_dirs()
+    return _cmd_convert_x_export(export_dir, args)
+
+
+def _cmd_convert_x_export(export_dir: str, args: argparse.Namespace) -> int:
+    include_deleted = bool(getattr(args, "include_deleted", False))
+    n_json, n_media, pending = _xe_convert_export(
+        export_dir, JSON_DIR, IMAGE_DIR, VIDEO_DIR, AVATAR_DIR,
+        safe_filename, None, safe_print, include_deleted=include_deleted,
+    )
+    if not n_json:
+        return 1
+
+    if not getattr(args, "no_fill_replied", False):
+        safe_print("")
+        _xe_fill_replied(export_dir, JSON_DIR, log=safe_print)
+
+    if pending:
+        media_index = build_media_index(scan_json=False, verbose=False)
+        done = 0
+        for item in pending:
+            url = item["url"]
+            key = extract_video_media_key(url)
+            if key and media_index.find_video(key):
+                continue
+            ok, _ = _download_one_video(
+                {"url": url}, item["ts"], media_index, force=False,
+            )
+            if ok:
+                done += 1
+        safe_print(f"[import-export] 视频下载完成 {done}/{len(pending)}")
+
+    safe_print("")
+    safe_print("[import-export] 导出包转换完成。接下来：")
+    safe_print("  python archive.py render-html   # 从 json/ 渲染 HTML")
+    safe_print("  python archive.py build-index   # 生成 index.json")
+    safe_print("")
+    safe_print("[import-export] 说明：X 导出包本身不含被回复推文的正文，")
+    safe_print("         已尝试从 Wayback 补齐；对方账号若未被归档则仍会缺失。")
+    return 0
+
+
 def cmd_convert(args: argparse.Namespace) -> int:
     """
     从 download_archive.py 的 dump 转成本项目格式。
@@ -4175,14 +4853,18 @@ def cmd_convert(args: argparse.Namespace) -> int:
     """
     dump_dir = args.dump_dir
     if not os.path.isdir(dump_dir):
-        safe_print(f"[convert] dump 目录不存在：{dump_dir}")
+        safe_print(f"[convert] 目录不存在：{dump_dir}")
         return 1
     ensure_output_dirs()
 
     # 1. 定位 snapshots.json 和 assets 目录
     snapshots_path, assets_dir = _find_dump_assets(dump_dir)
     if not snapshots_path:
-        safe_print(f"[convert] 在 {dump_dir} 里找不到 snapshots.json")
+        if _xe_is_export(dump_dir):
+            safe_print(f"[convert] 这是 X 官方数据导出包，请改用："
+                       f"python archive.py import-export {dump_dir}")
+        else:
+            safe_print(f"[convert] 在 {dump_dir} 里找不到 snapshots.json")
         return 1
     safe_print(f"[convert] dump_dir = {dump_dir}")
     safe_print(f"[convert] assets_dir = {assets_dir}")
@@ -5219,6 +5901,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-unreferenced", action="store_true",
                    help="同时复制未在任何 JSON 里引用的孤立媒体（默认跳过，行为更贴合成品）")
     p.set_defaults(func=cmd_convert)
+
+    # import-export
+    p = sub.add_parser("import-export",
+                       help="把 X 官方数据导出包转换为本项目格式（锁推/私密账号）")
+    p.add_argument("export_dir", help="X 导出包根目录（含 data/tweets.js）")
+    p.add_argument("--include-deleted", action="store_true",
+                   help="同时收录 deleted-tweets.js（你主动删过的推文，默认不收）")
+    p.add_argument("--no-fill-replied", action="store_true",
+                   help="不去 Wayback 补被回复/被引用推文的原文（默认会补）")
+    p.set_defaults(func=cmd_import_export)
 
     # render-html
     p = sub.add_parser("render-html", help="从 JSON 渲染伪 wayback HTML（私密账号）")
