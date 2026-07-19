@@ -149,21 +149,21 @@ HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 PROXY_BASE: str = os.environ.get("TWITTER_PROXY_BASE", "").rstrip("/")
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 2   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 5   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
-MAX_BACKOFF        = 15.0
+MAX_BACKOFF        = 60.0
 
 # 媒体下载 timeout —— 元组形式 (connect_timeout, read_timeout)
 # connect 给 5s（正常 TCP 握手远不需要这么久，超过说明服务器限速/不可达）
-MEDIA_TIMEOUT_IMAGE  = (3, 8)   # 图片/头像
-MEDIA_TIMEOUT_VIDEO  = (4, 12)   # 视频文件可能大
-WAYBACK_HTML_TIMEOUT = (4, 8)   # wayback HTML
+MEDIA_TIMEOUT_IMAGE  = (5, 40)   # 图片/头像
+MEDIA_TIMEOUT_VIDEO  = (5, 60)   # 视频文件可能大
+WAYBACK_HTML_TIMEOUT = (5, 60)   # wayback HTML
 
 # 默认并发与延迟（每个子命令可用 CLI 覆盖）
-DEFAULT_WORKERS_HTML   = 10
-DEFAULT_WORKERS_MEDIA  = 25
-DEFAULT_WORKERS_AVATAR = 20
+DEFAULT_WORKERS_HTML   = 7
+DEFAULT_WORKERS_MEDIA  = 8
+DEFAULT_WORKERS_AVATAR = 4
 DEFAULT_DELAY_HTML     = 0.8
 DEFAULT_DELAY_MEDIA    = 0.3
 DEFAULT_DELAY_AVATAR_RANGE = (0.05, 0.25)
@@ -4840,70 +4840,6 @@ def _cmd_convert_x_export(export_dir: str, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_delete_tweet(args: argparse.Namespace) -> int:
-    """删除指定推文：清掉 html/json/媒体文件 + archive_index 记录，之后重建索引。
-
-    用法：python archive.py delete-tweet <tweet_id> [<tweet_id> ...]
-    删完会自动 build-index，删掉的推文不会在 update 时复活。
-    """
-    ids = set(str(x).strip() for x in args.tweet_ids if str(x).strip())
-    if not ids:
-        safe_print("[delete-tweet] 未提供 tweet_id")
-        return 1
-    ensure_output_dirs()
-
-    removed_files = 0
-    matched_ids = set()
-
-    # 1. 找到并删除 html/ 和 json/ 里对应的文件
-    for d in (HTML_DIR, JSON_DIR):
-        if not os.path.isdir(d):
-            continue
-        for fn in list(os.listdir(d)):
-            m = re.search(r"_status_(\d+)\.(html|json)$", fn)
-            if m and m.group(1) in ids:
-                matched_ids.add(m.group(1))
-                fp = os.path.join(d, fn)
-                # 删 json 前，记下它引用的媒体，稍后清理
-                try:
-                    os.remove(fp)
-                    removed_files += 1
-                    safe_print(f"[delete-tweet] 删除 {os.path.basename(d)}/{fn}")
-                except OSError as e:
-                    safe_print(f"[delete-tweet] 删除失败 {fn}: {e}")
-
-    if not matched_ids:
-        safe_print(f"[delete-tweet] 没找到这些 tweet_id 的文件：{', '.join(ids)}")
-        return 1
-
-    # 2. 从 archive_index 移除相关 URL 记录（避免 update 时复活）
-    idx = load_archive_index()
-    removed_idx = 0
-    with _archive_index_lock:
-        for kind in list(idx.keys()):
-            bucket = idx.get(kind)
-            if not isinstance(bucket, dict):
-                continue
-            for key in list(bucket.keys()):
-                # key 里含 status_<id> 的就是这条推文相关的
-                if any(f"status/{tid}" in key or f"status_{tid}" in key
-                       for tid in matched_ids):
-                    del bucket[key]
-                    removed_idx += 1
-    save_archive_index(force=True)
-    safe_print(f"[delete-tweet] 已从 archive_index 移除 {removed_idx} 条记录")
-
-    # 3. 清内存缓存后重建索引（否则 build-index 可能用到已删推文的旧缓存）
-    global _archive_index_data
-    with _archive_index_lock:
-        _archive_index_data = None
-    safe_print(f"[delete-tweet] 删除 {len(matched_ids)} 条推文、{removed_files} 个文件，重建索引…")
-    _rebuild_args = argparse.Namespace()
-    cmd_build_index(_rebuild_args)
-    safe_print(f"[delete-tweet] 完成。记得 git add -A && commit && push 推送更改。")
-    return 0
-
-
 def cmd_convert(args: argparse.Namespace) -> int:
     """
     从 download_archive.py 的 dump 转成本项目格式。
@@ -5960,10 +5896,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_fetch_cdx)
 
     # convert
-    p = sub.add_parser("delete-tweet", help="删除指定推文（html/json/索引一起清，不会复活）")
-    p.add_argument("tweet_ids", nargs="+", help="要删除的 tweet_id，可多个")
-    p.set_defaults(func=cmd_delete_tweet)
-
     p = sub.add_parser("convert", help="把外部 dump 转换为本项目格式（私密账号）")
     p.add_argument("dump_dir", help="dump 根目录（含 snapshots.json 或子目录里有）")
     p.add_argument("--include-unreferenced", action="store_true",
