@@ -4840,6 +4840,70 @@ def _cmd_convert_x_export(export_dir: str, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete_tweet(args: argparse.Namespace) -> int:
+    """删除指定推文：清掉 html/json/媒体文件 + archive_index 记录，之后重建索引。
+
+    用法：python archive.py delete-tweet <tweet_id> [<tweet_id> ...]
+    删完会自动 build-index，删掉的推文不会在 update 时复活。
+    """
+    ids = set(str(x).strip() for x in args.tweet_ids if str(x).strip())
+    if not ids:
+        safe_print("[delete-tweet] 未提供 tweet_id")
+        return 1
+    ensure_output_dirs()
+
+    removed_files = 0
+    matched_ids = set()
+
+    # 1. 找到并删除 html/ 和 json/ 里对应的文件
+    for d in (HTML_DIR, JSON_DIR):
+        if not os.path.isdir(d):
+            continue
+        for fn in list(os.listdir(d)):
+            m = re.search(r"_status_(\d+)\.(html|json)$", fn)
+            if m and m.group(1) in ids:
+                matched_ids.add(m.group(1))
+                fp = os.path.join(d, fn)
+                # 删 json 前，记下它引用的媒体，稍后清理
+                try:
+                    os.remove(fp)
+                    removed_files += 1
+                    safe_print(f"[delete-tweet] 删除 {os.path.basename(d)}/{fn}")
+                except OSError as e:
+                    safe_print(f"[delete-tweet] 删除失败 {fn}: {e}")
+
+    if not matched_ids:
+        safe_print(f"[delete-tweet] 没找到这些 tweet_id 的文件：{', '.join(ids)}")
+        return 1
+
+    # 2. 从 archive_index 移除相关 URL 记录（避免 update 时复活）
+    idx = load_archive_index()
+    removed_idx = 0
+    with _archive_index_lock:
+        for kind in list(idx.keys()):
+            bucket = idx.get(kind)
+            if not isinstance(bucket, dict):
+                continue
+            for key in list(bucket.keys()):
+                # key 里含 status_<id> 的就是这条推文相关的
+                if any(f"status/{tid}" in key or f"status_{tid}" in key
+                       for tid in matched_ids):
+                    del bucket[key]
+                    removed_idx += 1
+    save_archive_index(force=True)
+    safe_print(f"[delete-tweet] 已从 archive_index 移除 {removed_idx} 条记录")
+
+    # 3. 清内存缓存后重建索引（否则 build-index 可能用到已删推文的旧缓存）
+    global _archive_index_data
+    with _archive_index_lock:
+        _archive_index_data = None
+    safe_print(f"[delete-tweet] 删除 {len(matched_ids)} 条推文、{removed_files} 个文件，重建索引…")
+    _rebuild_args = argparse.Namespace()
+    cmd_build_index(_rebuild_args)
+    safe_print(f"[delete-tweet] 完成。记得 git add -A && commit && push 推送更改。")
+    return 0
+
+
 def cmd_convert(args: argparse.Namespace) -> int:
     """
     从 download_archive.py 的 dump 转成本项目格式。
@@ -5896,6 +5960,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_fetch_cdx)
 
     # convert
+    p = sub.add_parser("delete-tweet", help="删除指定推文（html/json/索引一起清，不会复活）")
+    p.add_argument("tweet_ids", nargs="+", help="要删除的 tweet_id，可多个")
+    p.set_defaults(func=cmd_delete_tweet)
+
     p = sub.add_parser("convert", help="把外部 dump 转换为本项目格式（私密账号）")
     p.add_argument("dump_dir", help="dump 根目录（含 snapshots.json 或子目录里有）")
     p.add_argument("--include-unreferenced", action="store_true",
