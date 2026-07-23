@@ -5,16 +5,20 @@
 # 扫描组织下所有存档仓库的 avatar/ 目录，按 pid 去重后汇总到 home/avatars/，
 # 供 archive.py 下头像时优先命中（GitHub CDN 秒取，避免重复从 Wayback 下载）。
 #
-# 去重规则（同一个 avatar_{pid} 在多个仓库都有、且内容不同时）：
-#   1. 优先“最新的”（该文件最近一次提交时间更晚的那份）
-#   2. 若最新的仍并列，再取“文件体积较大”的那份
-# 内容完全相同（git blob sha 一致）时不查提交时间，直接用，省 API 调用。
+# 选优规则（同一个 avatar_{pid} 在多个仓库都有、且内容不同时）：
+#   同一个 pid 永远对应同一张图，差别只是 Wayback 存到的分辨率档位 /
+#   压缩程度不同，因此「哪份更清晰」是唯一有意义的标准：
+#     1. 像素面积（宽 × 高）大者胜 —— 真实解码测量，jpg/png 混存也能正确比较
+#     2. 像素相同再比文件字节数（压缩更轻者胜）
+#   池子里已有的旧版本也参与比较：新候选比现存的糊就保留现存的（防降级）。
+#   无法解码的候选按 0×0 处理，自然落败；全员损坏时按字节数取大保底。
 #
-# 只有“查冲突文件提交时间”这一步是多线程的（串行会非常慢）；
-# 扫各仓库、下载入池保持串行。
-# 在 home 仓库的 Action 里运行，只写 home 自己（用默认 GITHUB_TOKEN 即可）。
+# 冲突候选的下载与测量多线程进行；决策与写盘串行。
+# 在 home 仓库的 Action 里运行，只写 home 自己（默认 GITHUB_TOKEN 即可）。
+# 依赖：requests pillow
 # ============================================================================
 
+import io
 import json
 import os
 import re
@@ -25,22 +29,26 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from PIL import Image
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
+
 ORG = os.environ.get("AVATAR_POOL_ORG", "TwitterArchiver")
+
 # 额外纳入的仓库（组织外的，owner/name 形式，逗号分隔）。
-# 组织扫描已覆盖组织内全部仓库，默认留空；如需纳入组织外仓库再填。
 EXTRA_REPOS = [
     r.strip() for r in os.environ.get("AVATAR_POOL_EXTRA_REPOS", "").split(",")
     if r.strip()
 ]
+
 EXCLUDE_REPO_NAMES = {"home"}
 
 OUT_DIR = os.environ.get("AVATAR_POOL_OUT", "avatars")
 MANIFEST_PATH = os.path.join(OUT_DIR, "_manifest.json")
 
-# 仅用于“查冲突提交时间”阶段的并发线程数
-CONFLICT_WORKERS = int(os.environ.get("AVATAR_POOL_CONFLICT_WORKERS", "12"))
+# 扫描仓库 / 下载测量 两个阶段的并发线程数
+SCAN_WORKERS = int(os.environ.get("AVATAR_POOL_SCAN_WORKERS", "8"))
+FETCH_WORKERS = int(os.environ.get("AVATAR_POOL_FETCH_WORKERS", "12"))
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 API = "https://api.github.com"
@@ -52,9 +60,9 @@ SESSION.headers.update({
 })
 if TOKEN:
     SESSION.headers["Authorization"] = f"Bearer {TOKEN}"
-# 加大连接池，供冲突阶段并发用
+
 _adapter = requests.adapters.HTTPAdapter(
-    pool_connections=CONFLICT_WORKERS * 2, pool_maxsize=CONFLICT_WORKERS * 2,
+    pool_connections=FETCH_WORKERS * 2, pool_maxsize=FETCH_WORKERS * 2,
     max_retries=0,
 )
 SESSION.mount("https://", _adapter)
@@ -85,14 +93,14 @@ def api_get(url, params=None):
                     except ValueError:
                         pass
                 wait = min(wait, 90)
-                log(f"  [限流] 等 {wait}s 重试 …")
+                log(f"   [限流] 等 {wait}s 重试 …")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:
             if attempt == 3:
-                log(f"  [警告] GET 失败 {url}: {e}")
+                log(f"   [警告] GET 失败 {url}: {e}")
                 return None
             time.sleep(2 * (attempt + 1))
     return None
@@ -125,7 +133,7 @@ def list_contents(repo, path):
 
 def find_avatar_files(repo):
     """在一个仓库里找出所有账号的头像文件。
-       返回 [{pid,fname,sha,size,download_url,repo,path}, ...]"""
+    返回 [{pid,fname,sha,size,download_url,repo,path}, ...]"""
     found = []
     accounts = list_contents(repo, "accounts")
     acct_dirs = [c["name"] for c in accounts if c.get("type") == "dir"]
@@ -145,17 +153,18 @@ def find_avatar_files(repo):
     return found
 
 
-def commit_date(repo, filepath):
-    """该文件最近一次提交时间（epoch 秒）；查不到返回 0。"""
-    data = api_get(f"{API}/repos/{repo}/commits",
-                   params={"path": filepath, "per_page": 1})
-    if not data:
-        return 0
+def measure(content: bytes):
+    """返回 (宽, 高)；解码失败返回 (0, 0)。"""
     try:
-        iso = data[0]["commit"]["committer"]["date"]  # 2026-05-30T12:00:00Z
-        return int(time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")))
-    except (KeyError, IndexError, ValueError):
-        return 0
+        with Image.open(io.BytesIO(content)) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        return 0, 0
+
+
+def quality_key(c):
+    """清晰度排序键：像素面积优先，字节数决胜。"""
+    return (c.get("w", 0) * c.get("h", 0), c.get("bytes", 0))
 
 
 def load_manifest():
@@ -166,72 +175,131 @@ def load_manifest():
         return {}
 
 
+def backfill_dims(manifest):
+    """老版本 manifest 没有 w/h：就地测量本地池文件补齐（一次性迁移）。"""
+    filled = 0
+    for pid, ent in manifest.items():
+        if "w" in ent and "h" in ent:
+            continue
+        path = os.path.join(OUT_DIR, ent.get("file", ""))
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            data = f.read()
+        ent["w"], ent["h"] = measure(data)
+        ent["size"] = len(data)
+        filled += 1
+    if filled:
+        log(f"🧭 manifest 迁移：补齐 {filled} 条宽高信息")
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    manifest = load_manifest()  # pid -> {"file","sha","size","src"}
+    manifest = load_manifest()   # pid -> {"file","sha","size","w","h","src"}
+    backfill_dims(manifest)
 
     repos = list_org_repos(ORG) + EXTRA_REPOS
     log(f"📋 待扫描仓库：{len(repos)} 个")
 
-    # ── 扫各仓库（串行）────────────────────────────────────────────────────
-    by_pid = {}  # pid -> [候选 dict]
-    for i, repo in enumerate(repos, 1):
+    # ── 扫各仓库（并发）────────────────────────────────────────────────────
+    by_pid = {}          # pid -> [候选 dict]
+    _scan_done = [0]
+
+    def scan(repo):
         files = find_avatar_files(repo)
-        for c in files:
-            by_pid.setdefault(c["pid"], []).append(c)
-        log(f"  [{i}/{len(repos)}] {repo}: {len(files)} 个头像")
+        with _log_lock:
+            _scan_done[0] += 1
+            print(f"  [{_scan_done[0]}/{len(repos)}] {repo}: {len(files)} 个头像",
+                  flush=True)
+        return files
 
-    log(f"\n🔢 全站去重后唯一头像：{len(by_pid)} 个")
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for files in ex.map(scan, repos):
+            for c in files:
+                by_pid.setdefault(c["pid"], []).append(c)
 
-    # ── 分流：无冲突直接定，冲突项收集起来 ──────────────────────────────────
-    winners = {}        # pid -> 选中的候选 dict
-    conflict_pids = []  # 同 pid 内容不一致，需按 (最新, 最大) 决断
+    log(f"\n🔢 全站唯一头像：{len(by_pid)} 个")
+
+    # ── 分流：稳定项直接跳过，其余进入评估 ──────────────────────────────────
+    # 稳定 = 所有候选 sha 都等于池子现存 sha，且池文件还在
+    eval_pids = []
+    stable = 0
     for pid, cands in by_pid.items():
-        if len({c["sha"] for c in cands}) <= 1:
-            # 无冲突：内容一致（或只有一份），取体积最大那份即可
-            winners[pid] = max(cands, key=lambda c: c["size"])
-        else:
-            conflict_pids.append(pid)
-
-    # ── 查冲突文件提交时间（多线程，这步串行会非常慢）──────────────────────
-    if conflict_pids:
-        tasks = [c for pid in conflict_pids for c in by_pid[pid]]
-        log(f"⚖️  内容冲突头像 {len(conflict_pids)} 个（{len(tasks)} 个候选），"
-            f"{CONFLICT_WORKERS} 线程并发查提交时间 …")
-
-        def fill_ts(c):
-            c["_ts"] = commit_date(c["repo"], c["path"])
-
-        with ThreadPoolExecutor(max_workers=CONFLICT_WORKERS) as ex:
-            list(ex.map(fill_ts, tasks))
-
-        for pid in conflict_pids:
-            cands = by_pid[pid]
-            cands.sort(key=lambda c: (c.get("_ts", 0), c["size"]), reverse=True)
-            winners[pid] = cands[0]
-
-    # ── 下载入池（串行）────────────────────────────────────────────────────
-    downloaded = skipped = failed = 0
-    seen_pids = set(winners.keys())
-    total = len(winners)
-
-    for idx, (pid, winner) in enumerate(winners.items(), 1):
         prev = manifest.get(pid)
-        # 未变化：sha 一致且文件还在 → 跳过
-        if prev and prev.get("sha") == winner["sha"] and \
-                os.path.exists(os.path.join(OUT_DIR, prev.get("file", ""))):
-            skipped += 1
+        shas = {c["sha"] for c in cands}
+        if prev and shas == {prev.get("sha")} and \
+                os.path.isfile(os.path.join(OUT_DIR, prev.get("file", ""))):
+            stable += 1
             continue
-        if not winner["download_url"]:
-            continue
+        eval_pids.append(pid)
+
+    log(f"⚖️ 无变化 {stable} 个；需评估 {len(eval_pids)} 个")
+
+    # ── 下载并测量候选（并发；同 sha 只下一次）─────────────────────────────
+    tasks = []
+    for pid in eval_pids:
+        prev = manifest.get(pid)
+        seen_sha = set()
+        for c in by_pid[pid]:
+            if c["sha"] in seen_sha:
+                continue
+            # 池子现存的那份不用下载，本地就有
+            if prev and c["sha"] == prev.get("sha"):
+                seen_sha.add(c["sha"])
+                continue
+            if not c["download_url"]:
+                continue
+            seen_sha.add(c["sha"])
+            tasks.append(c)
+
+    log(f"⬇️ 需下载测量的候选：{len(tasks)} 个（{FETCH_WORKERS} 线程）")
+    fetch_failed = [0]
+
+    def fetch(c):
         try:
-            r = SESSION.get(winner["download_url"], timeout=60)
+            r = SESSION.get(c["download_url"], timeout=60)
             r.raise_for_status()
+            c["content"] = r.content
+            c["bytes"] = len(r.content)
+            c["w"], c["h"] = measure(r.content)
         except requests.RequestException as e:
+            c["content"] = None
+            with _log_lock:
+                fetch_failed[0] += 1
+                print(f"   [警告] 下载失败 {c['repo']}/{c['fname']}: {e}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        list(ex.map(fetch, tasks))
+
+    # ── 决策 + 写盘（串行）─────────────────────────────────────────────────
+    updated = kept = failed = 0
+    for idx, pid in enumerate(eval_pids, 1):
+        prev = manifest.get(pid)
+        cands = [c for c in by_pid[pid] if c.get("content")]
+
+        pool_entry = None
+        if prev:
+            pool_path = os.path.join(OUT_DIR, prev.get("file", ""))
+            if os.path.isfile(pool_path):
+                pool_entry = {
+                    "is_pool": True, "fname": prev["file"], "sha": prev.get("sha"),
+                    "bytes": prev.get("size", 0),
+                    "w": prev.get("w", 0), "h": prev.get("h", 0),
+                    "src": prev.get("src", ""),
+                }
+
+        contenders = cands + ([pool_entry] if pool_entry else [])
+        if not contenders:
             failed += 1
-            log(f"  [警告] 下载失败 pid={pid}: {e}")
             continue
-        # ext 变了的话，删掉旧扩展名的文件
+
+        winner = max(contenders, key=quality_key)
+
+        if winner.get("is_pool"):
+            kept += 1          # 防降级：现存的最清晰，保留
+            continue
+
+        # 扩展名变了的话，删掉旧文件
         if prev and prev.get("file") and prev["file"] != winner["fname"]:
             old = os.path.join(OUT_DIR, prev["file"])
             if os.path.exists(old):
@@ -239,20 +307,22 @@ def main():
                     os.remove(old)
                 except OSError:
                     pass
+
         with open(os.path.join(OUT_DIR, winner["fname"]), "wb") as f:
-            f.write(r.content)
+            f.write(winner["content"])
         manifest[pid] = {
             "file": winner["fname"], "sha": winner["sha"],
-            "size": winner["size"], "src": winner["repo"],
+            "size": winner["bytes"], "w": winner["w"], "h": winner["h"],
+            "src": winner["repo"],
         }
-        downloaded += 1
-        if downloaded % 200 == 0:
-            log(f"  … 已下载 {downloaded} 张（进度 {idx}/{total}）")
+        updated += 1
+        if updated % 200 == 0:
+            log(f"   … 已更新 {updated} 张（进度 {idx}/{len(eval_pids)}）")
 
     # ── 清理：池子里有、但全站已不存在的 pid ────────────────────────────────
     removed = 0
     for pid in list(manifest.keys()):
-        if pid not in seen_pids:
+        if pid not in by_pid:
             old = os.path.join(OUT_DIR, manifest[pid].get("file", ""))
             if os.path.exists(old):
                 os.remove(old)
@@ -262,8 +332,8 @@ def main():
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=0)
 
-    log(f"\n✅ 完成：新增/更新 {downloaded}，未变跳过 {skipped}，"
-        f"下载失败 {failed}，清理 {removed}（共处理 {total} 个唯一头像）")
+    log(f"\n✅ 完成：新增/更新 {updated}，无变化 {stable}，防降级保留 {kept}，"
+        f"下载失败 {fetch_failed[0]}，无可用候选 {failed}，清理 {removed}")
     log(f"📦 池子现有头像：{len(manifest)} 个")
     return 0
 
