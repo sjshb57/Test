@@ -1464,160 +1464,7 @@ def _clean_script_content(src: str) -> str:
     return src
 
 
-_TCO_TOKEN_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
-_WB_WRAP_RE   = re.compile(r"https?://web\.archive\.org/web/\d+[a-z_]*/(https?://.+)", re.I)
-
-
-def collect_tco_map(obj) -> dict:
-    """递归收集 JSON 里所有 t.co → 真实地址 的映射。
-
-    X API 的 entities.urls 分散在 data / includes.tweets / referenced 等多处，
-    t.co 短码全局唯一，整棵树扫一遍合并即可，不必关心具体路径。
-    """
-    out: dict[str, str] = {}
-
-    def _walk(o):
-        if isinstance(o, dict):
-            u, e = o.get("url"), o.get("expanded_url")
-            if isinstance(u, str) and "t.co/" in u and isinstance(e, str) and e:
-                out[u] = e
-            for v in o.values():
-                _walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                _walk(v)
-
-    _walk(obj)
-    return out
-
-
-def expand_tco(text: str, url_map: dict | None) -> str:
-    """把正文里残留的 t.co 换成真实地址。
-
-    媒体占位符（pic.x.com 那类）在此之前已由 remove_urls 机制删除，
-    走到这里的都是普通外链。没有映射的短链保持原样。
-    """
-    if not text or not url_map:
-        return text
-    for k, v in url_map.items():
-        if k in text:
-            text = text.replace(k, v)
-    return text
-
-
-def rewrite_short_links_soup(soup, url_map: dict | None = None) -> None:
-    """在已解析的 BS4 树上原地改写 t.co 短链（不碰缩进/格式，交给 prettify）。
-
-    ① <a> 锚文本是 t.co 的：
-        - 锚文本 → 真实地址去掉协议头（与官方 display_url 风格一致）
-        - href   → 真实地址（剥 Wayback 前缀直达原站）；但目标是 twitter/x.com
-                   的保留原 href——账号可能已被封，Wayback 快照才打得开
-       真实地址优先取 JSON entities（url_map），无 JSON 时从 href 的 Wayback 包裹剥。
-       已改写过的锚点（文本不再是 t.co）天然跳过，幂等。
-    ② 游离在文本节点里的纯文本 t.co（引用推文正文里的媒体占位符等）：
-       有映射且指向媒体 → 删；普通链接 → 换真实地址；无映射 → 原样。
-    """
-    media_re = re.compile(
-        r"https?://(?:www\.)?(?:x|twitter)\.com/[^/]+/status/\d+/(?:photo|video)/", re.I)
-
-    # ① 锚点
-    for a in soup.find_all("a"):
-        txt = (a.get_text() or "").strip()
-        if not _TCO_TOKEN_RE.fullmatch(txt):
-            continue
-        real = (url_map or {}).get(txt, "")
-        href = a.get("href", "") or ""
-        if not real:
-            wm = _WB_WRAP_RE.match(href)
-            if wm:
-                real = wm.group(1)
-            elif href.startswith("http") and "t.co/" not in href:
-                real = href
-        if not real or "t.co/" in real:
-            continue                       # 解不开：原样保留
-        display = re.sub(r"^https?://", "", real)
-        host = display.split("/")[0].lower().removeprefix("www.")
-        if host not in ("twitter.com", "x.com", "mobile.twitter.com"):
-            a["href"] = real               # 非推特目标才改 href
-        a.string = display                 # 锚文本换成 display 风格
-
-    # ② 文本节点里的游离 t.co
-    if url_map:
-        from bs4 import NavigableString
-        for node in list(soup.find_all(string=lambda t: t and "t.co/" in t)):
-            if node.parent and node.parent.name == "a":
-                continue                   # 锚点已在 ① 处理
-            def _sub(m):
-                real = url_map.get(m.group(0), "")
-                if not real:
-                    return m.group(0)
-                if media_re.match(real):
-                    return ""              # 媒体占位符：隐藏
-                return real
-            new_text = _TCO_TOKEN_RE.sub(_sub, str(node))
-            if new_text != str(node):
-                new_text = re.sub(r"[ \t]{2,}", " ", new_text)
-                node.replace_with(NavigableString(new_text))
-
-
-
-def _rewrite_short_links_inplace(html_text: str, url_map: dict | None = None) -> str:
-    """给「已清洗、不再 prettify」的 HTML 用：只在原文里替换锚点这一小段，
-    保持其余字符与缩进完全不变，因此幂等且不产生格式 diff。"""
-    _media_re = re.compile(
-        r"https?://(?:www\.)?(?:x|twitter)\.com/[^/]+/status/\d+/(?:photo|video)/", re.I)
-
-    def _fix_anchor(m: re.Match) -> str:
-        tag, inner, close = m.group(1), m.group(2), m.group(3)
-        tco = inner.strip()
-        real = (url_map or {}).get(tco, "")
-        hm = re.search(r'href="([^"]*)"', tag)
-        href = hm.group(1) if hm else ""
-        if not real:
-            wm = _WB_WRAP_RE.match(href)
-            if wm:
-                real = wm.group(1)
-            elif href.startswith("http") and "t.co/" not in href:
-                real = href
-        if not real or "t.co/" in real:
-            return m.group(0)
-        display = re.sub(r"^https?://", "", real)
-        host = display.split("/")[0].lower().removeprefix("www.")
-        new_tag = tag
-        if hm and host not in ("twitter.com", "x.com", "mobile.twitter.com"):
-            new_tag = tag[:hm.start(1)] + real + tag[hm.end(1):]
-        return new_tag + display + close
-
-    html_text = re.sub(
-        r'(<a\b[^>]*>)(\s*https?://t\.co/[A-Za-z0-9]+\s*)(</a>)',
-        _fix_anchor, html_text)
-
-    # 游离文本里的 t.co（仅在标签之外的文本节点上动手）
-    if url_map:
-        def _fix_node(node: str) -> str:
-            def _sub(m: re.Match) -> str:
-                real = url_map.get(m.group(0), "")
-                if not real:
-                    return m.group(0)
-                if _media_re.match(real):
-                    return ""
-                return real
-            out = _TCO_TOKEN_RE.sub(_sub, node)
-            return re.sub(r"[ \t]{2,}", " ", out) if out != node else node
-
-        parts = re.split(r"(<[^>]+>)", html_text)
-        for _i in range(0, len(parts), 2):
-            if "t.co/" in parts[_i]:
-                parts[_i] = _fix_node(parts[_i])
-        html_text = "".join(parts)
-
-    return html_text
-
-
-
-
-def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
-                    url_map: dict | None = None) -> str:
+def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex) -> str:
     """
     清洗与改写 HTML：
       1. 剥掉已有的 Source 注释（防止累积）
@@ -1688,9 +1535,6 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
     # 5. BS4：删 notice / jsonview / 无效媒体；替换 video
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # 短链改写（DOM 操作，格式交给后面的 prettify，不产生缩进噪音）
-    rewrite_short_links_soup(soup, url_map)
-
     for tag in soup.find_all("div", class_="notice"):
         tag.decompose()
     for tag in soup.find_all("div", id="jsonview"):
@@ -1757,14 +1601,11 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
     return f"<!-- Source: {source_url} -->\n" + cleaned
 
 
-def _replace_paths_only(html_text: str, source_url: str, media_index: MediaIndex,
-                        url_map: dict | None = None) -> str:
+def _replace_paths_only(html_text: str, source_url: str, media_index: MediaIndex) -> str:
     """
     已清洗过的 HTML 再次处理时，只替换媒体路径，不重跑 BS4/prettify。
     防止多次 prettify 导致 CSS 缩进累积或格式混乱。
-    短链改写在此用局部正则（只动 <a>…t.co…</a> 这一段，不触碰其它格式）。
     """
-    html_text = _rewrite_short_links_inplace(html_text, url_map)
     # 剥旧 Source 注释（单行）
     html_text = strip_existing_source_comments(html_text)
 
@@ -2663,22 +2504,12 @@ def cmd_clean_html(args: argparse.Namespace) -> int:
 
         source_url = _extract_source_url_from_filename(fname)
         already_cleaned = _is_html_cleaned(path)
-        # 对应 JSON 里的 entities 是短链映射的最可靠来源；没有 JSON 时
-        # rewrite_short_links 会退而从 href 的 Wayback 包裹里剥真实地址
-        url_map = None
-        _jp = os.path.join(JSON_DIR, os.path.splitext(fname)[0] + ".json")
-        if os.path.isfile(_jp):
-            try:
-                with open(_jp, encoding="utf-8") as _jf:
-                    url_map = collect_tco_map(json.load(_jf)) or None
-            except Exception:
-                url_map = None
         try:
             if already_cleaned:
                 # 已清洗过：只替换路径，不重跑 BS4/prettify（防止多次格式化累积）
-                cleaned = _replace_paths_only(content, source_url, media_index, url_map)
+                cleaned = _replace_paths_only(content, source_url, media_index)
             else:
-                cleaned = clean_html_text(content, source_url, media_index, url_map)
+                cleaned = clean_html_text(content, source_url, media_index)
         except Exception as e:
             safe_print(f"[{i}/{total}] ✗ {fname}  清洗失败：{type(e).__name__}: {e}")
             failed += 1
@@ -3076,7 +2907,6 @@ def _bi_extract_from_json(json_data: dict, tweet_id_index: dict | None = None) -
     data     = json_data.get("data", {})
     includes = json_data.get("includes", {})
     result["raw_text"]        = (data.get("text", "") or "")[:TEXT_MAX]
-    result["url_map"]         = collect_tco_map(json_data)
     result["tweet_id"]        = str(data.get("id", ""))
     result["conversation_id"] = str(data.get("conversation_id", ""))
     for ref in data.get("referenced_tweets", []):
@@ -3877,10 +3707,8 @@ def cmd_build_index(args: argparse.Namespace) -> int:
             return s.strip()
 
         raw_body = meta.get("raw_text") or render_data["body_text"]
-        clean_body = expand_tco(clean_urls(raw_body, meta.get("remove_urls", [])),
-                                meta.get("url_map"))
-        clean_text = expand_tco(clean_urls(text,     meta.get("remove_urls", [])),
-                                meta.get("url_map"))
+        clean_body = clean_urls(raw_body, meta.get("remove_urls", []))
+        clean_text = clean_urls(text,                     meta.get("remove_urls", []))
 
         record = {
             "file":            fname,
@@ -3919,10 +3747,8 @@ def cmd_build_index(args: argparse.Namespace) -> int:
             vid = emb["tweet_id"]
             if vid not in virtual_entries:
                 ts = emb.get("timestamp") or ""
-                emb_body = expand_tco(
-                    clean_urls(emb.get("body_text", ""),
-                               meta.get("embedded_remove_urls", [])),
-                    meta.get("url_map"))[:TEXT_MAX]
+                emb_body = clean_urls(emb.get("body_text", ""),
+                                      meta.get("embedded_remove_urls", []))[:TEXT_MAX]
                 virtual_entries[vid] = {
                     "file":            "",
                     "timestamp":       ts,
