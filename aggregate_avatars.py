@@ -78,12 +78,13 @@ def log(*a):
 
 
 def api_get(url, params=None):
-    """带轻量重试的 GET（返回解析后的 JSON，404 返回 None）。线程安全。"""
+    """带轻量重试的 GET。返回 (状态, json)：
+    状态 "ok" 正常 / "404" 不存在 / "err" 请求失败。线程安全。"""
     for attempt in range(4):
         try:
             r = SESSION.get(url, params=params, timeout=30)
             if r.status_code == 404:
-                return None
+                return "404", None
             if r.status_code in (403, 429):
                 reset = r.headers.get("X-RateLimit-Reset")
                 wait = 5 * (attempt + 1)
@@ -97,58 +98,83 @@ def api_get(url, params=None):
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json()
+            return "ok", r.json()
         except requests.RequestException as e:
             if attempt == 3:
                 log(f"   [警告] GET 失败 {url}: {e}")
-                return None
+                return "err", None
             time.sleep(2 * (attempt + 1))
-    return None
+    return "err", None
+
+
+# 扫描期间是否遇到过失败/截断（决定是否允许清理）
+SCAN_ERRORS = [0]
 
 
 def list_org_repos(org):
-    """列出组织下所有公开仓库（分页）。"""
+    """列出组织下所有公开仓库（分页）。返回 [(owner/name, 默认分支), ...]"""
     repos = []
     page = 1
     while True:
-        data = api_get(f"{API}/orgs/{org}/repos",
-                       params={"per_page": 100, "page": page, "type": "public"})
+        st, data = api_get(f"{API}/orgs/{org}/repos",
+                           params={"per_page": 100, "page": page, "type": "public"})
+        if st == "err":
+            SCAN_ERRORS[0] += 1
         if not data:
             break
         repos.extend(data)
         if len(data) < 100:
             break
         page += 1
-    return [f"{org}/{r['name']}" for r in repos
-            if r["name"] not in EXCLUDE_REPO_NAMES]
+    return [(f"{org}/{r['name']}", r.get("default_branch", "main"))
+            for r in repos if r["name"] not in EXCLUDE_REPO_NAMES]
 
 
 def list_contents(repo, path):
-    """列目录内容（文件项含 name/sha/size/download_url）。目录不存在返回 []。"""
-    data = api_get(f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}")
-    if not isinstance(data, list):
-        return []
-    return data
+    """列目录内容。目录不存在返回 []；请求失败记入 SCAN_ERRORS。
+    注意：此 API 单目录最多返回 1000 条，只可用于小目录。"""
+    st, data = api_get(f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}")
+    if st == "err":
+        SCAN_ERRORS[0] += 1
+    return data if isinstance(data, list) else []
 
 
-def find_avatar_files(repo):
+def find_avatar_files(repo, branch):
     """在一个仓库里找出所有账号的头像文件。
+    avatar 目录经常超过 1000 个文件，Contents API 会静默截断，
+    因此用 Git Trees API 取全量（上限 10 万条，且有 truncated 标志）。
     返回 [{pid,fname,sha,size,download_url,repo,path}, ...]"""
     found = []
     accounts = list_contents(repo, "accounts")
     acct_dirs = [c["name"] for c in accounts if c.get("type") == "dir"]
     for acct in acct_dirs:
-        avatar_path = f"accounts/{acct}/wayback_snapshots/avatar"
-        for f in list_contents(repo, avatar_path):
-            if f.get("type") != "file":
+        snap_path = f"accounts/{acct}/wayback_snapshots"
+        snap = list_contents(repo, snap_path)          # 小目录，不会截断
+        av = next((c for c in snap
+                   if c.get("name") == "avatar" and c.get("type") == "dir"), None)
+        if not av:
+            continue
+        st, tree = api_get(f"{API}/repos/{repo}/git/trees/{av['sha']}")
+        if st != "ok" or not tree:
+            SCAN_ERRORS[0] += 1
+            continue
+        if tree.get("truncated"):
+            log(f"   [警告] {repo} avatar 树被截断（>10 万条），本轮跳过清理")
+            SCAN_ERRORS[0] += 1
+        for e in tree.get("tree", []):
+            if e.get("type") != "blob":
                 continue
-            m = _AVATAR_RE.match(f["name"])
+            m = _AVATAR_RE.match(e["path"])
             if not m:
                 continue
+            full = f"{snap_path}/avatar/{e['path']}"
             found.append({
-                "pid": m.group(1), "fname": f["name"], "sha": f["sha"],
-                "size": f.get("size", 0), "download_url": f.get("download_url", ""),
-                "repo": repo, "path": f["path"],
+                "pid": m.group(1), "fname": e["path"], "sha": e["sha"],
+                "size": e.get("size", 0),
+                "download_url":
+                    f"https://raw.githubusercontent.com/{repo}/{branch}/"
+                    + urllib.parse.quote(full),
+                "repo": repo, "path": full,
             })
     return found
 
@@ -198,15 +224,16 @@ def main():
     manifest = load_manifest()   # pid -> {"file","sha","size","w","h","src"}
     backfill_dims(manifest)
 
-    repos = list_org_repos(ORG) + EXTRA_REPOS
+    repos = list_org_repos(ORG) + [(r, "main") for r in EXTRA_REPOS]
     log(f"📋 待扫描仓库：{len(repos)} 个")
 
     # ── 扫各仓库（并发）────────────────────────────────────────────────────
     by_pid = {}          # pid -> [候选 dict]
     _scan_done = [0]
 
-    def scan(repo):
-        files = find_avatar_files(repo)
+    def scan(item):
+        repo, branch = item
+        files = find_avatar_files(repo, branch)
         with _log_lock:
             _scan_done[0] += 1
             print(f"  [{_scan_done[0]}/{len(repos)}] {repo}: {len(files)} 个头像",
@@ -320,9 +347,20 @@ def main():
             log(f"   … 已更新 {updated} 张（进度 {idx}/{len(eval_pids)}）")
 
     # ── 清理：池子里有、但全站已不存在的 pid ────────────────────────────────
+    # 双保险：扫描有失败/截断，或要删的数量异常多，都跳过清理。
+    # 宁可池子里多留几张，也不能把还存在的头像误删
+    # （Contents API 单目录静默截断到 1000 条就曾造成过误删）。
     removed = 0
-    for pid in list(manifest.keys()):
-        if pid not in by_pid:
+    to_remove = [pid for pid in manifest if pid not in by_pid]
+    allow_mass = os.environ.get("AVATAR_POOL_ALLOW_MASS_DELETE") == "1"
+    if SCAN_ERRORS[0]:
+        log(f"⚠️ 扫描期间有 {SCAN_ERRORS[0]} 次失败/截断，本轮跳过清理"
+            f"（待删 {len(to_remove)} 个不动）")
+    elif len(to_remove) > 30 and not allow_mass:
+        log(f"⚠️ 待删数量异常（{len(to_remove)} > 30），跳过清理。"
+            f"确认无误可设 AVATAR_POOL_ALLOW_MASS_DELETE=1 放行")
+    else:
+        for pid in to_remove:
             old = os.path.join(OUT_DIR, manifest[pid].get("file", ""))
             if os.path.exists(old):
                 os.remove(old)
