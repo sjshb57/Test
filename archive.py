@@ -1505,18 +1505,69 @@ def expand_tco(text: str, url_map: dict | None) -> str:
     return text
 
 
-def rewrite_short_links(html_text: str, url_map: dict | None = None) -> str:
-    """改写「锚文本是 t.co」的链接为真实地址。
+def rewrite_short_links_soup(soup, url_map: dict | None = None) -> None:
+    """在已解析的 BS4 树上原地改写 t.co 短链（不碰缩进/格式，交给 prettify）。
 
-      - 锚文本 → 真实地址去掉协议头（与官方 display_url 风格一致）
-      - href   → 真实地址（剥掉 Wayback 前缀直达原站）；
-                 但目标是 twitter.com / x.com 的保留原 href——
-                 账号可能已被封，Wayback 快照反而是唯一能打开的版本
-    真实地址优先取 JSON entities（url_map），没有 JSON 时从 href 的
-    Wayback 包裹里剥。已改写过的锚点（文本不再是 t.co）天然跳过，幂等。
+    ① <a> 锚文本是 t.co 的：
+        - 锚文本 → 真实地址去掉协议头（与官方 display_url 风格一致）
+        - href   → 真实地址（剥 Wayback 前缀直达原站）；但目标是 twitter/x.com
+                   的保留原 href——账号可能已被封，Wayback 快照才打得开
+       真实地址优先取 JSON entities（url_map），无 JSON 时从 href 的 Wayback 包裹剥。
+       已改写过的锚点（文本不再是 t.co）天然跳过，幂等。
+    ② 游离在文本节点里的纯文本 t.co（引用推文正文里的媒体占位符等）：
+       有映射且指向媒体 → 删；普通链接 → 换真实地址；无映射 → 原样。
     """
+    media_re = re.compile(
+        r"https?://(?:www\.)?(?:x|twitter)\.com/[^/]+/status/\d+/(?:photo|video)/", re.I)
 
-    def _fix(m: re.Match) -> str:
+    # ① 锚点
+    for a in soup.find_all("a"):
+        txt = (a.get_text() or "").strip()
+        if not _TCO_TOKEN_RE.fullmatch(txt):
+            continue
+        real = (url_map or {}).get(txt, "")
+        href = a.get("href", "") or ""
+        if not real:
+            wm = _WB_WRAP_RE.match(href)
+            if wm:
+                real = wm.group(1)
+            elif href.startswith("http") and "t.co/" not in href:
+                real = href
+        if not real or "t.co/" in real:
+            continue                       # 解不开：原样保留
+        display = re.sub(r"^https?://", "", real)
+        host = display.split("/")[0].lower().removeprefix("www.")
+        if host not in ("twitter.com", "x.com", "mobile.twitter.com"):
+            a["href"] = real               # 非推特目标才改 href
+        a.string = display                 # 锚文本换成 display 风格
+
+    # ② 文本节点里的游离 t.co
+    if url_map:
+        from bs4 import NavigableString
+        for node in list(soup.find_all(string=lambda t: t and "t.co/" in t)):
+            if node.parent and node.parent.name == "a":
+                continue                   # 锚点已在 ① 处理
+            def _sub(m):
+                real = url_map.get(m.group(0), "")
+                if not real:
+                    return m.group(0)
+                if media_re.match(real):
+                    return ""              # 媒体占位符：隐藏
+                return real
+            new_text = _TCO_TOKEN_RE.sub(_sub, str(node))
+            if new_text != str(node):
+                new_text = re.sub(r"[ \t]{2,}", " ", new_text)
+                node.replace_with(NavigableString(new_text))
+
+
+
+def _rewrite_short_links_inplace(html_text: str, url_map: dict | None = None) -> str:
+    """给「已清洗、不再 prettify」的 HTML 用：只在原文里替换锚点这一小段，
+    保持其余字符与缩进完全不变，因此幂等且不产生格式 diff。"""
+    _media_re = re.compile(
+        r"https?://(?:www\.)?(?:x|twitter)\.com/[^/]+/status/\d+/(?:photo|video)/", re.I)
+
+    def _fix_anchor(m: re.Match) -> str:
         tag, inner, close = m.group(1), m.group(2), m.group(3)
         tco = inner.strip()
         real = (url_map or {}).get(tco, "")
@@ -1529,45 +1580,40 @@ def rewrite_short_links(html_text: str, url_map: dict | None = None) -> str:
             elif href.startswith("http") and "t.co/" not in href:
                 real = href
         if not real or "t.co/" in real:
-            return m.group(0)          # 解不开：原样保留
+            return m.group(0)
         display = re.sub(r"^https?://", "", real)
         host = display.split("/")[0].lower().removeprefix("www.")
-        keep_wayback = host in ("twitter.com", "x.com", "mobile.twitter.com")
         new_tag = tag
-        if hm and not keep_wayback:
+        if hm and host not in ("twitter.com", "x.com", "mobile.twitter.com"):
             new_tag = tag[:hm.start(1)] + real + tag[hm.end(1):]
         return new_tag + display + close
 
     html_text = re.sub(
         r'(<a\b[^>]*>)(\s*https?://t\.co/[A-Za-z0-9]+\s*)(</a>)',
-        _fix, html_text)
+        _fix_anchor, html_text)
 
-    # 第二遍：处理不在 <a> 里的纯文本 t.co（常见于引用推文正文里的媒体占位符）。
-    # 只改标签之外的文本节点，属性里的 href 等绝不触碰。
+    # 游离文本里的 t.co（仅在标签之外的文本节点上动手）
     if url_map:
-        _media_re = re.compile(
-            r"https?://(?:www\.)?(?:x|twitter)\.com/[^/]+/status/\d+/(?:photo|video)/", re.I)
-
-        def _fix_text_node(node: str) -> str:
+        def _fix_node(node: str) -> str:
             def _sub(m: re.Match) -> str:
                 real = url_map.get(m.group(0), "")
                 if not real:
-                    return m.group(0)          # 没映射：原样保留
+                    return m.group(0)
                 if _media_re.match(real):
-                    return ""                  # 媒体占位符：官方显示里是隐藏的，删
-                return real                    # 普通链接：换成真实地址
+                    return ""
+                return real
             out = _TCO_TOKEN_RE.sub(_sub, node)
-            if out != node:
-                out = re.sub(r"[ \t]{2,}", " ", out)
-            return out
+            return re.sub(r"[ \t]{2,}", " ", out) if out != node else node
 
         parts = re.split(r"(<[^>]+>)", html_text)
-        for _i in range(0, len(parts), 2):     # 偶数位是文本节点
+        for _i in range(0, len(parts), 2):
             if "t.co/" in parts[_i]:
-                parts[_i] = _fix_text_node(parts[_i])
+                parts[_i] = _fix_node(parts[_i])
         html_text = "".join(parts)
 
     return html_text
+
+
 
 
 def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
@@ -1584,8 +1630,6 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
     """
     # 1. 剥旧 Source
     html_text = strip_existing_source_comments(html_text)
-
-    html_text = rewrite_short_links(html_text, url_map)
 
     # 2. script 清理
     html_text = re.sub(
@@ -1643,6 +1687,9 @@ def clean_html_text(html_text: str, source_url: str, media_index: MediaIndex,
 
     # 5. BS4：删 notice / jsonview / 无效媒体；替换 video
     soup = BeautifulSoup(html_text, "html.parser")
+
+    # 短链改写（DOM 操作，格式交给后面的 prettify，不产生缩进噪音）
+    rewrite_short_links_soup(soup, url_map)
 
     for tag in soup.find_all("div", class_="notice"):
         tag.decompose()
@@ -1715,8 +1762,9 @@ def _replace_paths_only(html_text: str, source_url: str, media_index: MediaIndex
     """
     已清洗过的 HTML 再次处理时，只替换媒体路径，不重跑 BS4/prettify。
     防止多次 prettify 导致 CSS 缩进累积或格式混乱。
+    短链改写在此用局部正则（只动 <a>…t.co…</a> 这一段，不触碰其它格式）。
     """
-    html_text = rewrite_short_links(html_text, url_map)
+    html_text = _rewrite_short_links_inplace(html_text, url_map)
     # 剥旧 Source 注释（单行）
     html_text = strip_existing_source_comments(html_text)
 
