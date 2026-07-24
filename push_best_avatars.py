@@ -109,47 +109,103 @@ def _request(method, url, payload=None, params=None):
 
 
 def api_get(url, params=None):
-    try:
-        return _request("GET", url, params=params)
-    except Exception as e:
-        log(f"   [警告] GET 失败 {url}: {e}")
-        return None
+    """带轻量重试的 GET。返回 (状态, json)：
+    状态 "ok" 正常 / "404" 不存在 / "err" 请求失败。线程安全。"""
+    for attempt in range(4):
+        try:
+            r = SESSION.get(url, params=params, timeout=30)
+            if r.status_code == 404:
+                return "404", None
+            if r.status_code in (403, 429):
+                reset = r.headers.get("X-RateLimit-Reset")
+                wait = 5 * (attempt + 1)
+                if reset:
+                    try:
+                        wait = max(wait, int(reset) - int(time.time()) + 2)
+                    except ValueError:
+                        pass
+                wait = min(wait, 90)
+                log(f"   [限流] 等 {wait}s 重试 …")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return "ok", r.json()
+        except requests.RequestException as e:
+            if attempt == 3:
+                log(f"   [警告] GET 失败 {url}: {e}")
+                return "err", None
+            time.sleep(2 * (attempt + 1))
+    return "err", None
+
+
+# 扫描期间是否遇到过失败/截断（决定是否允许清理）
+SCAN_ERRORS = [0]
 
 
 def list_org_repos(org):
-    repos, page = [], 1
+    """列出组织下所有公开仓库（分页）。返回 [(owner/name, 默认分支), ...]"""
+    repos = []
+    page = 1
     while True:
-        data = api_get(f"{API}/orgs/{org}/repos",
-                       params={"per_page": 100, "page": page, "type": "public"})
+        st, data = api_get(f"{API}/orgs/{org}/repos",
+                           params={"per_page": 100, "page": page, "type": "public"})
+        if st == "err":
+            SCAN_ERRORS[0] += 1
         if not data:
             break
         repos.extend(data)
         if len(data) < 100:
             break
         page += 1
-    return [f"{org}/{r['name']}" for r in repos
-            if r["name"] not in EXCLUDE_REPO_NAMES]
+    return [(f"{org}/{r['name']}", r.get("default_branch", "main"))
+            for r in repos if r["name"] not in EXCLUDE_REPO_NAMES]
 
 
 def list_contents(repo, path):
-    data = api_get(f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}")
+    """列目录内容。目录不存在返回 []；请求失败记入 SCAN_ERRORS。
+    注意：此 API 单目录最多返回 1000 条，只可用于小目录。"""
+    st, data = api_get(f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}")
+    if st == "err":
+        SCAN_ERRORS[0] += 1
     return data if isinstance(data, list) else []
 
 
-def find_avatar_files(repo):
+def find_avatar_files(repo, branch):
+    """在一个仓库里找出所有账号的头像文件。
+    avatar 目录经常超过 1000 个文件，Contents API 会静默截断，
+    因此用 Git Trees API 取全量（上限 10 万条，且有 truncated 标志）。
+    返回 [{pid,fname,sha,size,download_url,repo,path}, ...]"""
     found = []
     accounts = list_contents(repo, "accounts")
-    for acct in [c["name"] for c in accounts if c.get("type") == "dir"]:
-        for f in list_contents(repo, f"accounts/{acct}/wayback_snapshots/avatar"):
-            if f.get("type") != "file":
+    acct_dirs = [c["name"] for c in accounts if c.get("type") == "dir"]
+    for acct in acct_dirs:
+        snap_path = f"accounts/{acct}/wayback_snapshots"
+        snap = list_contents(repo, snap_path)          # 小目录，不会截断
+        av = next((c for c in snap
+                   if c.get("name") == "avatar" and c.get("type") == "dir"), None)
+        if not av:
+            continue
+        st, tree = api_get(f"{API}/repos/{repo}/git/trees/{av['sha']}")
+        if st != "ok" or not tree:
+            SCAN_ERRORS[0] += 1
+            continue
+        if tree.get("truncated"):
+            log(f"   [警告] {repo} avatar 树被截断（>10 万条），本轮跳过清理")
+            SCAN_ERRORS[0] += 1
+        for e in tree.get("tree", []):
+            if e.get("type") != "blob":
                 continue
-            m = _AVATAR_RE.match(f["name"])
+            m = _AVATAR_RE.match(e["path"])
             if not m:
                 continue
+            full = f"{snap_path}/avatar/{e['path']}"
             found.append({
-                "pid": m.group(1), "fname": f["name"], "sha": f["sha"],
-                "download_url": f.get("download_url", ""),
-                "repo": repo, "path": f["path"],
+                "pid": m.group(1), "fname": e["path"], "sha": e["sha"],
+                "size": e.get("size", 0),
+                "download_url":
+                    f"https://raw.githubusercontent.com/{repo}/{branch}/"
+                    + urllib.parse.quote(full),
+                "repo": repo, "path": full,
             })
     return found
 
@@ -228,8 +284,9 @@ def main():
     all_files = []
     _done = [0]
 
-    def scan(repo):
-        files = find_avatar_files(repo)
+    def scan(item):
+        repo, branch = item
+        files = find_avatar_files(repo, branch)
         with _log_lock:
             _done[0] += 1
             print(f"  [{_done[0]}/{len(repos)}] {repo}: {len(files)} 个头像", flush=True)
