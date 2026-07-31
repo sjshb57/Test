@@ -149,7 +149,7 @@ HEADERS_TWITTER_REFERER = {**HEADERS, "Referer": "https://twitter.com/"}
 PROXY_BASE: str = os.environ.get("TWITTER_PROXY_BASE", "").rstrip("/")
 
 # 重试 / 退避
-REQUEST_ATTEMPTS   = 2   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
+REQUEST_ATTEMPTS   = 1   # 网络瞬断/超时/SSL 的最大重试次数；4xx 本身不重试
 BACKOFF_BASE       = 0.4
 BACKOFF_JITTER_MAX = 0.2
 MAX_BACKOFF        = 10.0
