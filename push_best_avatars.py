@@ -143,20 +143,35 @@ SCAN_ERRORS = [0]
 
 
 def list_org_repos(org):
-    """列出组织下所有公开仓库（分页）。返回 [(owner/name, 默认分支), ...]"""
+    """列出组织下所有仓库（含私有，分页）。返回 [(owner/name, 默认分支), ...]
+
+    分页失败必须报错退出，不能 break：静默截断会让后面几百个仓库一次都没扫到，
+    而日志上只表现为"待扫描仓库"数字偏小，极难发现。"""
     repos = []
     page = 1
     while True:
-        st, data = api_get(f"{API}/orgs/{org}/repos",
-                           params={"per_page": 100, "page": page, "type": "public"})
-        if st == "err":
+        data = None
+        for attempt in range(3):
+            st, data = api_get(f"{API}/orgs/{org}/repos",
+                               params={"per_page": 100, "page": page, "type": "all"})
+            if st != "err":
+                break
             SCAN_ERRORS[0] += 1
+            time.sleep(2 * (attempt + 1))
+        else:
+            raise RuntimeError(f"列举组织仓库第 {page} 页连续失败，中止以免只扫到一部分")
         if not data:
             break
         repos.extend(data)
         if len(data) < 100:
             break
         page += 1
+
+    expected = api_get(f"{API}/orgs/{org}")[1] or {}
+    total = (expected.get("public_repos") or 0) + (expected.get("total_private_repos") or 0)
+    if total and len(repos) < total * 0.9:
+        raise RuntimeError(f"只列出 {len(repos)} 个仓库，组织实际约 {total} 个，疑似分页截断")
+
     return [(f"{org}/{r['name']}", r.get("default_branch", "main"))
             for r in repos if r["name"] not in EXCLUDE_REPO_NAMES]
 
@@ -337,18 +352,21 @@ def main():
             fetch_fail += 1
             continue
         ent = manifest[f["pid"]]
-        pool_area = ent.get("w", 0) * ent.get("h", 0)
-        repo_area = f["w"] * f["h"]
-        if repo_area > pool_area:
+        # 与 aggregate_avatars.py 的 quality_key 保持一致：(像素面积, 字节数)。
+        # 之前这里只比面积，导致同尺寸但压缩更狠的糊图被判成"打平"永远换不掉——
+        # 实测同为 400×400、仓库版 2.8KB 对池子版 31KB，那是缩略图拉伸的结果。
+        pool_key = (ent.get("w", 0) * ent.get("h", 0), ent.get("size", 0))
+        repo_key = (f["w"] * f["h"], f.get("bytes", 0))
+        if repo_key > pool_key:
             repo_better += 1             # 仓库版更清晰：留给 aggregate 收编
-        elif repo_area == pool_area:
-            equal += 1                   # 打平：不折腾
+        elif repo_key == pool_key:
+            equal += 1                   # 完全一致：不折腾
         else:
             plan.setdefault(f["repo"], []).append(f)
 
     total_push = sum(len(v) for v in plan.values())
     log(f"⚖️ 决断：应推送 {total_push}（涉及 {len(plan)} 个仓库），"
-        f"仓库版更优 {repo_better}，像素打平 {equal}，下载失败 {fetch_fail}")
+        f"仓库版更优 {repo_better}，完全一致 {equal}，下载失败 {fetch_fail}")
 
     if repo_better:
         log("   ↑ 「仓库版更优」说明池子落后了，建议先重跑一轮汇总头像池")
