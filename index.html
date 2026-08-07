@@ -328,7 +328,20 @@ a:hover { text-decoration: underline; }
 .p-user         { color: var(--text-dim); font-size: 15px; }
 .p-bio          { margin: 12px 0 8px; font-size: 15px; color: var(--text); line-height: 1.5; white-space: pre-wrap; }
 .p-meta         { color: var(--text-dim); font-size: 14px; display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
-.p-meta span    { display: flex; align-items: center; gap: 4px; }
+.p-meta span    { display: flex; align-items: center; gap: 4px; min-width: 0; }
+/* 换行交给 flex-wrap，长度交给 ellipsis —— 浏览器原生就能做应用端手动测量的事。
+   1ch 是字符「0」的宽度，所以 26ch 按实际字形宽度封顶，中文占得多、拉丁占得少，
+   比数字符更接近肉眼判断。min() 让窄屏取 100%、宽屏被 26ch 管住。 */
+#p-loc          { max-width: 55%; }
+#p-loc, #p-link { overflow: hidden; }
+#p-loc span, #p-link a {
+  display: inline-block;
+  max-width: min(100%, 26ch);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
 
 /* ── 搜索栏 + 吸顶区域 ────────────────────────────────── */
 .sticky-area {
@@ -1330,7 +1343,7 @@ async function loadProfile() {
     }
     // 位置里也可能出现链接，同样剥前缀（应用端 LinkUtil.stripInText 的行为）
     if (c.location) document.getElementById('p-loc').innerHTML =
-      `📍 ${esc(c.location).replace(URL_IN_TEXT, m => stripUrlPrefix(m))}`;
+      `📍 <span>${esc(c.location).replace(URL_IN_TEXT, m => stripUrlPrefix(m))}</span>`;
     if (c.link) {
       // 裸域名（无协议头）会被浏览器当作相对路径，href 统一补 https://
       document.getElementById('p-link').innerHTML =
@@ -2961,7 +2974,8 @@ function stripUrlPrefix(raw) {
     .replace(/^www\./i, '')
     .replace(/\/$/, '');
 }
-function displayUrl(raw, max = 27) {
+/* 宽度由 CSS 的 ellipsis 负责，这里只拦异常数据，避免超长串把 DOM 撑爆 */
+function displayUrl(raw, max = 120) {
   const bare = stripUrlPrefix(raw);
   return bare.length <= max ? bare : bare.slice(0, max) + '…';
 }
@@ -2970,17 +2984,22 @@ function fullUrl(raw) {
   return /^https?:\/\//i.test(t) ? t : 'https://' + t;
 }
 
-/* 正文里的 URL 到 CJK 或全角标点为止——\S+ 会把紧跟其后的中文一起吞进去 */
-const URL_IN_TEXT = /https?:\/\/[^\s\u3000-\u303f\u4e00-\u9fff\uff00-\uffef&lt;&gt;&amp;"]+/gi;
+/* 正文里的 URL 到 CJK 或中文标点为止——\S+ 会把紧跟其后的中文一起吞进去。
+   \u201c\u201d 是全角引号，不在 \uff00-\uffef 区间内，得单独排除。
+   &lt; &gt; &amp; 是因为本函数在 esc() 之后执行，HTML 实体已经成形。 */
+const URL_CHARS = '[^\\s\\u2018\\u2019\\u201c\\u201d\\u3000-\\u303f\\u4e00-\\u9fff\\uff00-\\uffef&lt;&gt;&amp;"]+';
+const URL_IN_TEXT = new RegExp('https?:\\/\\/' + URL_CHARS, 'gi');
+/* URL 与 @用户名 合并成一条、单次扫描。分两次 replace 的话，
+   形如 https://x.com/@user 的链接会在第二遍被再替换一次，产生嵌套 <a>。 */
+const LINK_OR_MENTION = new RegExp('(https?:\\/\\/' + URL_CHARS + ')|(@[A-Za-z0-9_]+)', 'gi');
 
 /* bio / 纯文本里的 URL 和 @用户名 转成可点击链接（链接文字剥掉协议头） */
 function linkifyText(text) {
   if (!text) return '';
-  let s = esc(text);
-  s = s.replace(URL_IN_TEXT, m =>
-    `<a href="${m}" target="_blank" style="color:var(--accent,#1d9bf0)">${stripUrlPrefix(m)}</a>`);
-  s = s.replace(/@([A-Za-z0-9_]+)/g, '<a href="https://x.com/$1" target="_blank" style="color:var(--accent,#1d9bf0)">@$1</a>');
-  return s;
+  const st = 'color:var(--accent,#1d9bf0)';
+  return esc(text).replace(LINK_OR_MENTION, (m, url, mention) =>
+    url ? `<a href="${url}" target="_blank" style="${st}">${stripUrlPrefix(url)}</a>`
+        : `<a href="https://x.com/${mention.slice(1)}" target="_blank" style="${st}">${mention}</a>`);
 }
 
 /* 用 profile.json 里的 bio_entities 精确渲染 bio 链接（有 entities 用 entities，否则 fallback 到 linkifyText） */
@@ -2999,12 +3018,10 @@ function renderBioWithEntities(text, entities) {
       result = result.replace(escapedDisplay, link);
     }
   }
-  // entities 没覆盖到的裸链接：同样剥掉协议头再显示
-  result = result.replace(URL_IN_TEXT, m =>
-    `<a href="${m}" target="_blank" style="${accentStyle}">${stripUrlPrefix(m)}</a>`);
-  // @用户名 统一用正则替换（不依赖 entities.mentions 是否完整）
-  result = result.replace(/@([A-Za-z0-9_]+)/g,
-    (_, name) => `<a href="https://x.com/${name}" target="_blank" style="${accentStyle}">@${name}</a>`);
+  // entities 没覆盖到的裸链接 + @用户名，一次扫描完成
+  result = result.replace(LINK_OR_MENTION, (m, url, mention) =>
+    url ? `<a href="${url}" target="_blank" style="${accentStyle}">${stripUrlPrefix(url)}</a>`
+        : `<a href="https://x.com/${mention.slice(1)}" target="_blank" style="${accentStyle}">${mention}</a>`);
   return result;
 }
 
