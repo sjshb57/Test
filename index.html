@@ -407,6 +407,27 @@ a:hover { text-decoration: underline; }
 }
 .day-heading { font-size: 16px; font-weight: 800; color: var(--text); }
 .day-heading .dim { font-weight: 400; font-size: 13px; color: var(--text-dim); margin-left: 6px; }
+/* 手机端把标题本身也做成打开日期抽屉的入口。
+   banner 上那个汉堡按钮压在用户自定义图片上，再怎么调色都可能不显眼，
+   这里提供一个始终清晰的第二入口。桌面端侧栏常驻，不需要也不显示箭头。 */
+.day-heading .cal-arrow { display: none; }
+@media (max-width: 900px) {
+  .day-heading {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .day-heading .cal-arrow {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-dim);
+    transform: translateY(1px);
+  }
+  .day-heading:active { opacity: .6; }
+}
 .order-btn {
   font-size: 13px; padding: 5px 14px;
   border: 1px solid var(--border); border-radius: 999px;
@@ -890,19 +911,27 @@ body.light .post-iframe-wrap { background: #ffffff; }
     margin-right: 0;     /* 取消和搜索框之间的间距 */
     margin-left: -4px;   /* 往左挤一点 */
   }
-  /* 三条线 —— banner 是用户自定义图片不随主题切换
-     固定用深灰，无论主题切换都不变 */
+  /* 三条线 —— banner 是用户上传的任意图片，固定深色或固定白色都会在某些图上糊掉。
+     改为 JS 采样 banner 左上角实际像素后决定明暗（见 tuneBurgerColor），
+     这里只给一个中性默认值兜底。--burger-halo 是反向的柔和阴影，
+     用于图案繁杂、明暗混杂的局部，避免线条被背景纹理吃掉。 */
+  .menu-toggle-banner {
+    --burger-ink: rgba(40, 40, 40, 0.85);
+    --burger-halo: rgba(255, 255, 255, 0.45);
+    filter: drop-shadow(0 0 1.5px var(--burger-halo));
+    transition: filter 0.2s;
+  }
   .menu-toggle-banner::before {
     content: "";
     display: block;
     width: 17px;
     height: 1.5px;
-    background: rgba(40, 40, 40, 0.85);
+    background: var(--burger-ink);
     box-shadow:
-      0 -5px 0 rgba(40, 40, 40, 0.85),
-      0 5px 0 rgba(40, 40, 40, 0.85);
+      0 -5px 0 var(--burger-ink),
+      0 5px 0 var(--burger-ink);
     border-radius: 1px;
-    transition: background 0.15s, box-shadow 0.15s;
+    transition: background 0.2s, box-shadow 0.2s;
   }
   /* 搜索栏按钮（不在 banner 上）：暗色默认白线，浅色主题改深线 */
   .menu-toggle-search::before {
@@ -1042,7 +1071,7 @@ body.light .post-iframe-wrap { background: #ffffff; }
       </div>
 
       <div class="day-topbar">
-        <div class="day-heading" id="day-heading">选择日期浏览</div>
+        <div class="day-heading" id="day-heading" onclick="openDatePicker()">选择日期浏览<span class="cal-arrow">▾</span></div>
         <button class="order-btn" id="order-btn" onclick="toggleOrder()">↑ 旧→新</button>
       </div>
 
@@ -1263,7 +1292,7 @@ async function switchAccount(dir) {
   document.getElementById('search-input').value = '';
   // 主内容区恢复欢迎页（避免显示上个账号的内容残留或空白）
   const dayHeading = document.getElementById('day-heading');
-  if (dayHeading) dayHeading.textContent = '选择日期浏览';
+  if (dayHeading) dayHeading.innerHTML = '选择日期浏览<span class="cal-arrow">▾</span>';
   const area = document.getElementById('content-area');
   if (area) area.innerHTML = `
       <div class="welcome">
@@ -1294,15 +1323,18 @@ async function loadProfile() {
     // 保存当前账号 username（去 @ 转小写）—— 用于 reply-card 识别主人 vs 外人
     ownerUsername = (c.username || '').replace(/^@/, '').toLowerCase();
     if (c.avatar) document.getElementById('p-avatar').src = `${ASSET_BASE}${c.avatar}`;
-    if (c.banner) document.getElementById('p-banner').src = `${ASSET_BASE}${c.banner}`;
-    if (c.location) document.getElementById('p-loc').innerHTML  = `📍 ${esc(c.location)}`;
+    if (c.banner) {
+      const bn = document.getElementById('p-banner');
+      bn.addEventListener('load', () => tuneBurgerColor(bn), { once: true });
+      bn.src = `${ASSET_BASE}${c.banner}`;
+    }
+    // 位置里也可能出现链接，同样剥前缀（应用端 LinkUtil.stripInText 的行为）
+    if (c.location) document.getElementById('p-loc').innerHTML =
+      `📍 ${esc(c.location).replace(URL_IN_TEXT, m => stripUrlPrefix(m))}`;
     if (c.link) {
-      // 修复：裸域名（无协议头）会被浏览器当作相对路径，统一加上 https://
-      const rawLink = c.link;
-      const href = rawLink.startsWith('http://') || rawLink.startsWith('https://')
-        ? rawLink : 'https://' + rawLink;
-      const d = rawLink.replace(/^https?:\/\//, '');
-      document.getElementById('p-link').innerHTML = `🔗 <a href="${esc(href)}" target="_blank">${esc(d)}</a>`;
+      // 裸域名（无协议头）会被浏览器当作相对路径，href 统一补 https://
+      document.getElementById('p-link').innerHTML =
+        `🔗 <a href="${esc(fullUrl(c.link))}" target="_blank">${esc(displayUrl(c.link))}</a>`;
     }
     // 用账号头像作为 favicon（Canvas 裁成圆形）
     if (c.avatar) {
@@ -1434,6 +1466,19 @@ function collapseAll(){ document.querySelectorAll('.tree-year,.tree-month').forE
 
 /* ── 手机端抽屉控制（≤640px）─────────────────────────── */
 function isMobile() { return window.matchMedia('(max-width: 900px)').matches; }
+/* 打开日期抽屉。桌面端侧栏常驻，点标题不做任何事。 */
+function openDatePicker() {
+  if (!isMobile()) return;
+  const sb = document.querySelector('.sidebar');
+  if (sb && sb.classList.contains('open')) { closeSidebar(); return; }
+  toggleSidebar();
+  // 抽屉里内容可能很长，滚到当前选中的那一天
+  requestAnimationFrame(() => {
+    const cur = sb && sb.querySelector('.day-item.active, .tree-day.active, .active');
+    if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'center' });
+  });
+}
+
 function toggleSidebar() {
   const sb = document.querySelector('.sidebar');
   const ov = document.getElementById('sidebar-overlay');
@@ -1507,7 +1552,7 @@ function selectDay(dk, skipScroll = false) {
   const [y,m,d] = dk.split('-');
   const items = treeData[y]?.[m]?.[d]||[];
   document.getElementById('day-heading').innerHTML =
-    `${y}年${m}月${d}日<span class="dim">${items.length} 篇</span>`;
+    `${y}年${m}月${d}日<span class="dim">${items.length} 篇</span><span class="cal-arrow">▾</span>`;
 
   // 判断是否是最新那天，是的话在推文tab最前插入置顶
   const latestDay = getLatestDay();
@@ -2528,7 +2573,7 @@ function doSearch(kw) {
     if (found) { exactMode = true; exactItem = found; displayKw = trimmed; }
   }
 
-  document.getElementById('day-heading').innerHTML=`"${esc(displayKw)}"`;
+  document.getElementById('day-heading').innerHTML=`"${esc(displayKw)}"<span class="cal-arrow">▾</span>`;
 
   const area=document.getElementById('content-area');
 
@@ -2695,9 +2740,9 @@ function exitSearch() {
     const items=treeData[y]?.[m]?.[d]||[];
     renderDayView(items);
     document.getElementById('day-heading').innerHTML=
-      `${y}年${m}月${d}日<span class="dim">${items.length} 篇</span>`;
+      `${y}年${m}月${d}日<span class="dim">${items.length} 篇</span><span class="cal-arrow">▾</span>`;
   } else {
-    document.getElementById('day-heading').textContent='选择日期浏览';
+    document.getElementById('day-heading').innerHTML='选择日期浏览<span class="cal-arrow">▾</span>';
     document.getElementById('content-area').innerHTML=`
       <div class="welcome">
         <div class="welcome-icon">✦</div>
@@ -2845,11 +2890,95 @@ function toggleTheme(){ applyTheme(!isLight); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escRe(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
 
-/* bio / 纯文本里的 URL 和 @用户名 转成可点击链接 */
+/* 按 banner 左上角的实际像素决定汉堡按钮的明暗。
+   固定深色在深色 banner 上看不见，固定白色在浅色 banner 上看不见，
+   加圆底或描边又破坏观感，所以直接量一下那块到底是什么颜色。
+
+   同时算局部方差：图案繁杂的区域（比如左上角正好压着文字或高对比图案）
+   单靠明暗判断不可靠，这时把反向阴影加重，让线条始终有轮廓。 */
+function tuneBurgerColor(img) {
+  const btn = document.getElementById('menu-toggle-banner');
+  if (!btn || !img.naturalWidth) return;
+  const bw = img.clientWidth, bh = img.clientHeight;
+  if (!bw || !bh) { requestAnimationFrame(() => tuneBurgerColor(img)); return; }
+  try {
+    // banner 是 object-fit: cover —— 先按覆盖比例缩放，再居中裁掉溢出的部分。
+    // 所以屏幕左上角对应的原图坐标不是 (0,0)，直接从 (0,0) 取样会取到被裁掉的区域。
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    const s  = Math.max(bw / nw, bh / nh);      // cover 的缩放系数
+    const offX = (nw * s - bw) / 2;             // 水平被裁掉的量（居中裁剪）
+    const offY = (nh * s - bh) / 2;
+
+    const R  = 52;                              // 按钮 36px + 8px 边距 + 余量，CSS 像素
+    const sx = offX / s;                        // 换算回原图坐标
+    const sy = offY / s;
+    const sw = Math.max(1, Math.min(R / s, nw - sx));
+    const sh = Math.max(1, Math.min(R / s, nh - sy));
+
+    const cv = document.createElement('canvas');
+    cv.width = 16; cv.height = 16;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, 16, 16);
+    const d = ctx.getImageData(0, 0, 16, 16).data;
+
+    let sum = 0, sum2 = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      // 相对亮度（sRGB 感知加权），比简单平均更接近肉眼判断
+      const l = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+      sum += l; sum2 += l * l; n++;
+    }
+    const mean = sum / n;
+    const sd   = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+
+    // 临界值 0.22 是解出来的：白线(L=1)与深线(L=0.02)对比度相等处
+    // (1.05)/(x+0.05) = (x+0.05)/0.07。取 0.55 会让中灰背景误判成白线，
+    // 而中灰上白线对比度只有 1.8:1，深线有 8:1。
+    const dark = mean > 0.22;
+    const ink  = dark ? 'rgba(28, 28, 30, 0.92)' : 'rgba(255, 255, 255, 0.95)';
+    // 繁杂区域（方差大）阴影加重，纯色区域几乎看不出阴影
+    const a    = sd > 0.18 ? 0.75 : 0.35;
+    const halo = dark ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a})`;
+
+    btn.style.setProperty('--burger-ink', ink);
+    btn.style.setProperty('--burger-halo', halo);
+    btn.style.filter = `drop-shadow(0 0 ${sd > 0.18 ? 2 : 1.5}px ${halo})`;
+  } catch (e) {
+    // 跨域或 Electron 自定义协议下 canvas 可能被污染，保持 CSS 默认值即可
+  }
+}
+
+// 视口变化会改变 cover 的裁剪范围，重新取样
+window.addEventListener('resize', () => {
+  const bn = document.getElementById('p-banner');
+  if (bn && bn.complete && bn.naturalWidth) tuneBurgerColor(bn);
+});
+
+/* 链接的显示形式，与应用端 util/LinkUtil.kt 保持一致：
+   去掉 https:// http:// www. 和结尾斜杠，过长则截断。href 始终用原始完整 URL。 */
+function stripUrlPrefix(raw) {
+  return String(raw).trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/^www\./i, '')
+    .replace(/\/$/, '');
+}
+function displayUrl(raw, max = 27) {
+  const bare = stripUrlPrefix(raw);
+  return bare.length <= max ? bare : bare.slice(0, max) + '…';
+}
+function fullUrl(raw) {
+  const t = String(raw).trim();
+  return /^https?:\/\//i.test(t) ? t : 'https://' + t;
+}
+
+/* 正文里的 URL 到 CJK 或全角标点为止——\S+ 会把紧跟其后的中文一起吞进去 */
+const URL_IN_TEXT = /https?:\/\/[^\s\u3000-\u303f\u4e00-\u9fff\uff00-\uffef&lt;&gt;&amp;"]+/gi;
+
+/* bio / 纯文本里的 URL 和 @用户名 转成可点击链接（链接文字剥掉协议头） */
 function linkifyText(text) {
   if (!text) return '';
   let s = esc(text);
-  s = s.replace(/(https?:\/\/[^\s&lt;&gt;&amp;"]+)/g, '<a href="$1" target="_blank" style="color:var(--accent,#1d9bf0)">$1</a>');
+  s = s.replace(URL_IN_TEXT, m =>
+    `<a href="${m}" target="_blank" style="color:var(--accent,#1d9bf0)">${stripUrlPrefix(m)}</a>`);
   s = s.replace(/@([A-Za-z0-9_]+)/g, '<a href="https://x.com/$1" target="_blank" style="color:var(--accent,#1d9bf0)">@$1</a>');
   return s;
 }
@@ -2870,6 +2999,9 @@ function renderBioWithEntities(text, entities) {
       result = result.replace(escapedDisplay, link);
     }
   }
+  // entities 没覆盖到的裸链接：同样剥掉协议头再显示
+  result = result.replace(URL_IN_TEXT, m =>
+    `<a href="${m}" target="_blank" style="${accentStyle}">${stripUrlPrefix(m)}</a>`);
   // @用户名 统一用正则替换（不依赖 entities.mentions 是否完整）
   result = result.replace(/@([A-Za-z0-9_]+)/g,
     (_, name) => `<a href="https://x.com/${name}" target="_blank" style="${accentStyle}">@${name}</a>`);
