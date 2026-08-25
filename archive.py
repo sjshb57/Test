@@ -3597,7 +3597,7 @@ def cmd_build_index(args: argparse.Namespace) -> int:
             _new_name = _me_user.get("name", "")
             _new_bio = _resolve_with_entities(_me_user.get("description", ""), _dsc_ents)
             if _new_bio:
-                _new_bio = _new_bio.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+                _new_bio = _new_bio.replace("\r\n", "\n").replace("\r", "\n")
             _new_loc = _me_user.get("location", "")
             _new_link = _resolve_with_entities(_me_user.get("url", ""), _url_ents)
 
